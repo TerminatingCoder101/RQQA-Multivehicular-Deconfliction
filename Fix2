@@ -30,9 +30,10 @@ const R_AGENT = 0.5 # Radius of the moving agent (Vehicle 1)
 const D_SAFE = 2.0 # Desired clearance distance from the obstacle's radius
 const D_MIN_TOTAL = D_SAFE + R_AGENT # The minimum allowed distance between vehicle centers
 
-# Second-order CBF parameters (h_ddot + K1*h_dot + K2*h >= 0)
-const K1 = 1.0
-const K2 = 2.0
+# Second-order CBF parameters, tuned to be more conservative
+# to counteract discretization error at high speeds.
+const K1 = 5.0
+const K2 = 6.0
 
 # Control limits
 const V_MIN, V_MAX = 0.0, 2.0   # Min/max velocity [m/s]
@@ -102,7 +103,7 @@ function run_simulation()
         # QP formulation: min (u-u_n)'*H*(u-u_n)
         # We use a weighting matrix H to balance the cost of turning vs. braking.
         H = diagm([
-            20.0,   # Moderate cost for changing acceleration
+            10.0,   # Adjusted cost for changing acceleration
             0.1,    # Low cost for changing angular velocity (encourages turning)
             1.0,    # Cost for vehicle 2 (doesn't matter as it's stationary)
             1.0

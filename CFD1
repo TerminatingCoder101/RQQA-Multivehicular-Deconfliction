@@ -93,9 +93,9 @@ function run_simulation()
         b_cbf_lower = -Lfh
 
         # QP formulation: min (u-u_n)'*H*(u-u_n)
-        # We use a weighting matrix H to make turning "cheaper" than braking.
+        # Use a weighting matrix H to make turning "cheaper" than braking.
         H = diagm([
-            100, # Very High cost for changing acceleration
+            100, # Very high cost for changing acceleration
             1,  # Very low cost for changing angular velocity (strongly encourages turning)
             1.0, # Agent 2 doesn't matter
             1.0
