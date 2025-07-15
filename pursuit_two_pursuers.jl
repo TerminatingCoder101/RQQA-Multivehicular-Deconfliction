@@ -40,9 +40,66 @@ const V_MAX_2 = 2.2
 const A_MIN, A_MAX = -1.0, 1.0
 const W_MIN, W_MAX = -pi, pi
 
-# --- 2. Main Simulation Function ---
+
 
 function run_simulation()
+    # --- Initialization ---
+    # States: [x, y, psi, v]
+    pursuer1_state = [0.0, -5.0, 0.0, 0.0]
+    pursuer2_state = [0.0, 5.0, 0.0, 0.0]
+    evader_state = [10.0, 0.0, pi, 0.0]
+
+    pursuer1_traj = [pursuer1_state]
+    pursuer2_traj = [pursuer2_state]
+    evader_traj = [evader_state]
+
+    for step in 1:N_STEPS
+        # --- Evader strategy: simple constant velocity escape ---
+        evader_control = [0.2, 0.0]
+        evader_state = evader_state .+ DT .* vehicle_dynamics(evader_state, evader_control)
+
+        # --- Each pursuer's optimization problem ---
+        pursuer1_control = [0.0, 0.0]
+        pursuer2_control = [0.0, 0.0]
+
+        # --- Pursuer 1 simple proportional pursuit ---
+        dx1 = evader_state[1] - pursuer1_state[1]
+        dy1 = evader_state[2] - pursuer1_state[2]
+        angle_to_evader1 = atan(dy1, dx1)
+        pursuer1_control = [0.5, angle_to_evader1 - pursuer1_state[3]]
+
+        # --- Pursuer 2 simple proportional pursuit ---
+        dx2 = evader_state[1] - pursuer2_state[1]
+        dy2 = evader_state[2] - pursuer2_state[2]
+        angle_to_evader2 = atan(dy2, dx2)
+        pursuer2_control = [0.5, angle_to_evader2 - pursuer2_state[3]]
+
+        # --- Apply dynamics ---
+        pursuer1_state = pursuer1_state .+ DT .* vehicle_dynamics(pursuer1_state, pursuer1_control)
+        pursuer2_state = pursuer2_state .+ DT .* vehicle_dynamics(pursuer2_state, pursuer2_control)
+
+        # --- Record trajectories ---
+        push!(pursuer1_traj, pursuer1_state)
+        push!(pursuer2_traj, pursuer2_state)
+        push!(evader_traj, evader_state)
+    end
+
+    # --- Plot Results ---
+    traj1 = reduce(hcat, pursuer1_traj)
+    traj2 = reduce(hcat, pursuer2_traj)
+    traj_ev = reduce(hcat, evader_traj)
+
+    plot(traj1[1, :], traj1[2, :], label="Pursuer 1", lw=2)
+    plot!(traj2[1, :], traj2[2, :], label="Pursuer 2", lw=2)
+    plot!(traj_ev[1, :], traj_ev[2, :], label="Evader", lw=2, ls=:dash)
+    scatter!([traj1[1, 1], traj2[1, 1], traj_ev[1, 1]], 
+             [traj1[2, 1], traj2[2, 1], traj_ev[2, 1]], 
+             label=["P1 Start" "P2 Start" "Evader Start"])
+    scatter!([traj1[1, end], traj2[1, end], traj_ev[1, end]], 
+             [traj1[2, end], traj2[2, end], traj_ev[2, end]], 
+             label=["P1 End" "P2 End" "Evader End"])
+end
+
     # --- Initialization ---
     # Vehicle 1 (Evader): Starts on the left, goal is on the right
     state1 = [-10.0, 1.0, 0.0, V_MAX_1]
@@ -55,14 +112,11 @@ function run_simulation()
     hist_state2 = [state2]
     hist_control2 = [[0.0, 0.0]]
 
-    # Vehicle 3 (Pursuer): Starts on the bottom, goal is Vehicle 1
-    state3 = [0.0, -]
-
     println("Starting simulation...")
 
     # --- Simulation Loop ---
     for i in 1:N_STEPS
-        # --- Check if goal is reached ---
+        # --- Check if the goal has been reached or not ---
         if norm(state1[1:2] - goal1) < 0.3
             println("Evader reached goal at step $i. Stopping simulation.")
             break
@@ -88,6 +142,7 @@ function run_simulation()
 
 
         # --- Second-Order CBF-QP Safety Filter ---
+
         p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
         p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
         
@@ -119,7 +174,7 @@ function run_simulation()
         P = sparse(H * 2.0)
         q = -2.0 * H * [u_n1; u_n2]
         
-        # Constraints
+        # THe Constraints
         A = sparse([A_cbf; I])
         l = [b_cbf_lower; A_MIN; W_MIN; A_MIN; W_MIN]
         u = [Inf; A_MAX; W_MAX; A_MAX; W_MAX]
@@ -155,9 +210,7 @@ function run_simulation()
 
     println("Simulation finished.")
     return hist_state1, hist_state2, hist_control1, hist_control2
-end
 
-# --- 3. Plotting and Animation Function ---
 
 function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2)
     println("Generating plots and animation...")

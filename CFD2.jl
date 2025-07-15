@@ -3,11 +3,7 @@ using Plots
 using LinearAlgebra
 using SparseArrays
 
-# --- 1. System and Simulation Parameters ---
 
-# Vehicle Dynamics Model: Second-order unicycle model
-# state = [x, y, psi, v] (position, heading, and forward speed)
-# control = [a, w] (forward acceleration and angular velocity)
 function vehicle_dynamics(state, control)
     x, y, psi, v = state
     a, w = control
@@ -25,37 +21,33 @@ const DT = 0.1      # Time step [s]
 const T_MAX = 15.0    # Max simulation time [s]
 const N_STEPS = Int(T_MAX / DT)
 
-# Safety and physical parameters
-const R_AGENT = 0.5 # Radius of the moving agent (Vehicle 1)
-const D_SAFE = 2.0 # Desired clearance distance from the obstacle's radius
-const D_MIN_TOTAL = D_SAFE + R_AGENT # The minimum allowed distance between vehicle centers
+const R_AGENT = 0.5
+const D_SAFE = 2.0 
+const D_MIN_TOTAL = D_SAFE + R_AGENT 
 
 # Second-order CBF parameters (h_ddot + K1*h_dot + K2*h >= 0)
 const K1 = 1.0
 const K2 = 2.0
 
 # Control limits
-const V_MIN, V_MAX = 0.0, 2.0   # Min/max velocity [m/s]
-const A_MIN, A_MAX = -1.0, 1.0  # Min/max acceleration [m/s^2]
-const W_MIN, W_MAX = -pi, pi # Min/max angular velocity [rad/s]
+const V_MIN, V_MAX = 0.0, 2.0
+const A_MIN, A_MAX = -1.0, 1.0 
+const W_MIN, W_MAX = -pi, pi 
 
-# --- 2. Main Simulation Function ---
 
 function run_simulation()
-    # --- Initialization ---
     # Vehicle 1: Starts on the left, goal is on the right
-    state1 = [-10.0, 0.1, 0.0, V_MAX] # Start with max velocity
-    goal1 = [5.0, -2.5] # The fixed goal for Vehicle 1
+    state1 = [-10.0, 0.1, 0.0, V_MAX]
+    goal1 = [5.0, -2.5]
     hist_state1 = [state1]
     hist_control1 = [[0.0, 0.0]]
 
-    # Vehicle 2: The stationary "obstacle" is now offset to force a more complex maneuver
+    
     state2 = [0.0, -0.5, 0.0, 0.0]
     hist_state2 = [state2]
 
     println("Starting simulation...")
 
-    # --- Simulation Loop ---
     for i in 1:N_STEPS
         # --- Check if goal is reached ---
         if norm(state1[1:2] - goal1) < 0.2
@@ -64,7 +56,6 @@ function run_simulation()
         end
 
         # --- Nominal Controller ---
-        # Vehicle 1's nominal controller always tries to drive it towards its fixed goal.
         error1 = goal1 - state1[1:2]
         angle_to_goal1 = atan(error1[2], error1[1])
         psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
@@ -77,7 +68,6 @@ function run_simulation()
         # Vehicle 2's nominal control is to do nothing.
         u_n2 = [0.0, 0.0]
 
-        # --- Second-Order CBF-QP Safety Filter ---
         p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
         p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
         
@@ -86,7 +76,7 @@ function run_simulation()
         v2_vec = v2 * [cos(psi2), sin(psi2)]
         delta_v = v1_vec - v2_vec
 
-        # The barrier function h now includes the agent's radius
+
         h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
         h_dot = 2 * dot(delta_p, delta_v)
 
@@ -100,11 +90,10 @@ function run_simulation()
         b_cbf_lower = -Lfh
 
         # QP formulation: min (u-u_n)'*H*(u-u_n)
-        # We use a weighting matrix H to balance the cost of turning vs. braking.
         H = diagm([
-            20.0,   # Moderate cost for changing acceleration
-            0.1,    # Low cost for changing angular velocity (encourages turning)
-            1.0,    # Cost for vehicle 2 (doesn't matter as it's stationary)
+            20.0, 
+            0.1,    
+            1.0,    
             1.0
         ])
         
@@ -116,7 +105,6 @@ function run_simulation()
         l = [b_cbf_lower; A_MIN; W_MIN; A_MIN; W_MIN]
         u = [Inf; A_MAX; W_MAX; A_MAX; W_MAX]
         
-        # Create and solve the OSQP problem
         model = OSQP.Model()
         OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
@@ -147,7 +135,6 @@ function run_simulation()
     return hist_state1, hist_state2, hist_control1
 end
 
-# --- 3. Plotting and Animation Function ---
 
 function plot_and_animate(hist_state1, hist_state2, hist_control1)
     println("Generating plots and animation...")
@@ -183,7 +170,6 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1)
 
     static_plot = plot(p_traj, p_vel, p_rot, layout=(1,3), size=(1800, 500))
     
-    # Save the static plot to a file instead of displaying it
     plot_path = "cbf_analysis_plots.png"
     savefig(static_plot, plot_path)
     println("Analysis plots saved to $plot_path")
@@ -200,7 +186,7 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1)
         plot!(x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta),
               seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1", color=:blue)
 
-        # Plot stationary Vehicle 2 and the CORRECT safety zone
+        # Plot stationary Vehicle 2
         scatter!([x2_pos], [y2_pos], label="Obstacle", marker=:star5, markersize=8, color=:black)
         plot!(x2_pos .+ D_MIN_TOTAL .* cos.(theta), y2_pos .+ D_MIN_TOTAL .* sin.(theta),
               seriestype=:shape, fillalpha=0.2, lw=0, label="Safety Zone", color=:red)
@@ -214,8 +200,6 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1)
     println("Animation saved to $gif_path")
 end
 
-
-# --- Run Simulation and Generate GIF ---
 hist_state1, hist_state2, hist_control1 = run_simulation()
 plot_and_animate(hist_state1, hist_state2, hist_control1)
 

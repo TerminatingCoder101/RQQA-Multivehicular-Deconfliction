@@ -3,11 +3,6 @@ using Plots
 using LinearAlgebra
 using SparseArrays
 
-# --- 1. System and Simulation Parameters ---
-
-# Vehicle Dynamics Model: Second-order unicycle model
-# state = [x, y, psi, v] (position, heading, and forward speed)
-# control = [a, w] (forward acceleration and angular velocity)
 function vehicle_dynamics(state, control)
     x, y, psi, v = state
     a, w = control

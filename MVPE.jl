@@ -1,38 +1,8 @@
-#=
-This script simulates a multi-agent pursuit-evasion scenario.
-- One "Evader" (Vehicle 1): Tries to reach a fixed goal and uses a CBF
-  to avoid all pursuers.
-- Multiple "Pursuers": Faster than the evader, they do not have a CBF and
-  will only ever move directly towards the evader.
-
-This scenario demonstrates the CBF's ability to handle multiple dynamic
-threats simultaneously.
-
-This version saves all output to files (a .png for analysis plots and a
-.gif for the animation) and does not open any interactive windows.
-
-Dependencies:
-- OSQP: A fast and reliable quadratic programming solver.
-- Plots: For visualizing the results.
-- LinearAlgebra: For vector and matrix operations.
-- SparseArrays: For creating sparse matrices required by OSQP.
-
-To run this, you need to have these packages installed in your Julia environment:
-using Pkg
-Pkg.add("OSQP")
-Pkg.add("Plots")
-Pkg.add("LinearAlgebra")
-Pkg.add("SparseArrays")
-=#
-
 using OSQP
 using Plots
 using LinearAlgebra
 using SparseArrays
 
-# --- 1. System and Simulation Parameters ---
-
-# A struct to hold vehicle information for cleaner code
 mutable struct Vehicle
     state::Vector{Float64} # [x, y, psi, v]
     control::Vector{Float64} # [a, w]
@@ -50,19 +20,20 @@ end
 
 # Simulation parameters
 const DT = 0.1      # Time step [s]
-const T_MAX = 20.0    # Max simulation time [s]
+const T_MAX = 25.0    # Max simulation time [s]
 const N_STEPS = Int(T_MAX / DT)
 
-# Safety and physical parameters
-const R_AGENT = 0.5 # Radius of all agents
-const D_MIN_TOTAL = 2 * R_AGENT + 0.5 # Min distance between centers
 
-# Second-order CBF parameters
-const K1 = 2.0
-const K2 = 1.0
+const R_AGENT = 0.5
+const D_MIN_TOTAL = 2 * R_AGENT + 0.5 
+
+
+const K1 = 1.5
+const K2 = 0.5
+
 # Control limits
-const A_MIN, A_MAX = -1.0, 1.0  # Min/max acceleration [m/s^2]
-const W_MIN, W_MAX = -pi, pi # Min/max angular velocity [rad/s]
+const A_MIN, A_MAX = -1.0, 1.0
+const W_MIN, W_MAX = -pi, pi 
 
 # --- 2. Main Simulation Function ---
 
@@ -70,24 +41,24 @@ function run_simulation()
     # --- Initialization ---
     # Vehicle 1 (Evader)
     evader = Vehicle(
-        [-10.0, 0.0, 0.0, 2.0], # state
+        [-12.0, 0.0, 0.0, 2.0], # state
         [0.0, 0.0], # control
-        [[-10.0, 0.0, 0.0, 2.0]], # hist_state
+        [[-12.0, 0.0, 0.0, 2.0]], # hist_state
         [[0.0, 0.0]], # hist_control
         2.0 # v_max
     )
-    goal = [10.0, 0.0]
+    goal = [12.0, 0.0]
 
-    # Adding a third pursuer to create a more complex gauntlet.
+
     pursuers = [
         Vehicle([-2.0, 4.0, -pi/2, 2.2], [0,0], [[-2.0, 4.0, -pi/2, 2.2]], [[0,0]], 2.2),
-        Vehicle([0.0, -5.0, pi/2, 2.2], [0,0], [[2.0, -4.0, pi/2, 2.2]], [[0,0]], 2.2),
+        Vehicle([3.0, -4.0, pi/2, 2.2], [0,0], [[3.0, -4.0, pi/2, 2.2]], [[0,0]], 2.2)
     ]
     num_pursuers = length(pursuers)
 
     println("Starting simulation with 1 Evader and $num_pursuers Pursuers...")
 
-    # --- Simulation Loop ---
+
     for i in 1:N_STEPS
         # --- Check if goal is reached ---
         if norm(evader.state[1:2] - goal) < 0.3
@@ -103,9 +74,9 @@ function run_simulation()
         w_n1 = 2.0 * psi_error1
         u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
 
-        # --- Nominal Controllers for Pursuers (they don't use CBF) ---
+
         for p in pursuers
-            goal_p = evader.state[1:2] # Pursuer's goal is always the evader
+            goal_p = evader.state[1:2] # Pursuer's goal == evader
             error_p = goal_p - p.state[1:2]
             angle_to_goal_p = atan(error_p[2], error_p[1])
             psi_error_p = atan(sin(angle_to_goal_p - p.state[3]), cos(angle_to_goal_p - p.state[3]))
@@ -115,9 +86,6 @@ function run_simulation()
         end
 
         # --- CBF-QP Safety Filter for the EVADER ONLY ---
-        # The QP will solve for the evader's control [a1, w1]
-        # It needs one constraint for each pursuer.
-        
         A_cbf = Matrix{Float64}(undef, num_pursuers, 2)
         b_cbf_lower = Vector{Float64}(undef, num_pursuers)
 
@@ -133,8 +101,6 @@ function run_simulation()
             h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
             h_dot = 2 * dot(delta_p, delta_v)
             
-            # Since pursuers are uncontrolled from the evader's perspective,
-            # their acceleration is part of the Lfh term.
             v2_dot_vec = p.control[1]*[cos(psi2),sin(psi2)] + p.control[2]*v2*[-sin(psi2),cos(psi2)]
             
             Lfh_j = 2*dot(delta_v,delta_v) - 2*dot(delta_p, v2_dot_vec) + K1*h_dot + K2*h
@@ -189,12 +155,10 @@ function run_simulation()
     return evader, pursuers, goal
 end
 
-# --- 3. Plotting and Animation Function ---
 
 function plot_and_animate(evader, pursuers, goal)
     println("Generating plots and animation...")
     
-    # --- Extract data ---
     num_steps_run = length(evader.hist_state) - 1
     time_axis_states = 0:DT:(num_steps_run * DT)
     time_axis_controls = 0:DT:((num_steps_run-1) * DT)
@@ -222,14 +186,14 @@ function plot_and_animate(evader, pursuers, goal)
     end
 
     static_plot = plot(p_traj, p_vel, p_rot, layout=(1,3), size=(1800, 500))
-    plot_path = "cbf_analysis_plots_multipursuit.png"
+    plot_path = "cbf_analysis_plots_two_pursuers.png"
     savefig(static_plot, plot_path)
     println("Analysis plots saved to $plot_path")
 
-    # --- Generate Animation ---
+
     anim = @animate for i in 1:length(evader.hist_state)
-        plot(xlims=(-12, 12), ylims=(-10, 10), aspect_ratio=:equal,
-             xlabel="x [m]", ylabel="y [m]", title="Multi-Pursuer Evasion (Frame $i)")
+        plot(xlims=(-15, 15), ylims=(-15, 15), aspect_ratio=:equal,
+             xlabel="x [m]", ylabel="y [m]", title="Two-Pursuer Evasion (Frame $i)")
 
         # Plot Evader
         plot!([s[1] for s in evader.hist_state[1:i]], [s[2] for s in evader.hist_state[1:i]], label="Evader Path", lw=2, color=:blue)
@@ -247,7 +211,7 @@ function plot_and_animate(evader, pursuers, goal)
         scatter!([goal[1]], [goal[2]], label="Goal", marker=:xcross, markersize=8, color=:green)
     end
 
-    gif_path = "cbf_simulation_multipursuit.gif"
+    gif_path = "cbf_simulation_two_pursuers.gif"
     gif(anim, gif_path, fps = 15)
     println("Animation saved to $gif_path")
 end
