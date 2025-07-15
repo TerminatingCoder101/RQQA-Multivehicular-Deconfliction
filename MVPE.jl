@@ -3,223 +3,254 @@ using Plots
 using LinearAlgebra
 using SparseArrays
 
-mutable struct Vehicle
-    state::Vector{Float64} # [x, y, psi, v]
-    control::Vector{Float64} # [a, w]
-    hist_state::Vector{Vector{Float64}}
-    hist_control::Vector{Vector{Float64}}
-    v_max::Float64
-end
-
-# Vehicle Dynamics Model
-function vehicle_dynamics(state, control)
-    x, y, psi, v = state
-    a, w = control
-    return [v * cos(psi), v * sin(psi), w, a]
-end
+#==============================================================================
+# SIMULATION PARAMETERS
+==============================================================================#
 
 # Simulation parameters
-const DT = 0.1      # Time step [s]
-const T_MAX = 25.0    # Max simulation time [s]
+const DT = 0.1 # Time step [s]
+const T_MAX = 20.0
 const N_STEPS = Int(T_MAX / DT)
 
+# Agent physical properties
+const R_AGENT = 0.5 # Radius of agent
+const D_MIN_TOTAL = 2.5 * R_AGENT # Minimum safe distance between agent centers
 
-const R_AGENT = 0.5
-const D_MIN_TOTAL = 2 * R_AGENT + 0.5 
+# --- Pursuit Logic ---
+const T_PREDICT = 0.1 # Prediction horizon for intercept logic [s]
 
+# --- i-HOCBF Parameters ---
+# Based on the paper: https://arxiv.org/pdf/2203.07978
+const K1 = 3.0   # Corresponds to alpha_1 in the paper
+const K2 = 2.0   # Corresponds to alpha_2 gain in the paper
+const K_I = 1.5  # Integral gain for the sigma term
 
-const K1 = 1.5
-const K2 = 0.5
+# --- Vehicle Dynamics Control Model ---
+# We model the vehicle's linear acceleration as a first-order response
+# to a velocity command, a = K_v * (v_ref - v_current).
+# This allows us to use [v_ref, w] as controls while maintaining a relative degree of 2.
+const K_v = 1.0 # Gain for the velocity controller
 
 # Control limits
-const A_MIN, A_MAX = -1.0, 1.0
-const W_MIN, W_MAX = -pi, pi 
+const V_MAX_1 = 2.0 
+const V_MAX_2 = 3.0
+const W_MIN, W_MAX = -pi, pi
 
-# --- 2. Main Simulation Function ---
 
+#==============================================================================
+# SIMULATION
+==============================================================================#
 function run_simulation()
-    # --- Initialization ---
-    # Vehicle 1 (Evader)
-    evader = Vehicle(
-        [-12.0, 0.0, 0.0, 2.0], # state
-        [0.0, 0.0], # control
-        [[-12.0, 0.0, 0.0, 2.0]], # hist_state
-        [[0.0, 0.0]], # hist_control
-        2.0 # v_max
-    )
-    goal = [12.0, 0.0]
 
+    # Vehicle 1 (Evader): Starts on the left, goal is on the right
+    state1 = [-10.0, 1.0, 0.0, V_MAX_1]
+    goal1 = [10.0, 1.0]
+    hist_state1 = [state1]
+    hist_control1 = [[0.0, 0.0]]
 
-    pursuers = [
-        Vehicle([-2.0, 4.0, -pi/2, 2.2], [0,0], [[-2.0, 4.0, -pi/2, 2.2]], [[0,0]], 2.2),
-        Vehicle([3.0, -4.0, pi/2, 2.2], [0,0], [[3.0, -4.0, pi/2, 2.2]], [[0,0]], 2.2)
-    ]
-    num_pursuers = length(pursuers)
+    # Vehicle 2 (Pursuer): Starts on the right, goal is Vehicle 1
+    state2 = [5.0, -1.0, pi, V_MAX_2]
+    hist_state2 = [state2]
+    hist_control2 = [[0.0, 0.0]]
+    
+    # History for visualization
+    hist_intercept_points = []
+    
+    # Integral CBF state variable
+    sigma = 0.0
+    hist_cbf = [(h=0.0, h_dot=0.0, sigma=0.0)] # History for h, h_dot, sigma
 
-    println("Starting simulation with 1 Evader and $num_pursuers Pursuers...")
+    println("Starting simulation with Intercept Logic and i-HOCBF...")
 
-
+    # --- Simulation Loop ---
     for i in 1:N_STEPS
-        # --- Check if goal is reached ---
-        if norm(evader.state[1:2] - goal) < 0.3
+        # Check if the goal has been reached
+        if norm(state1[1:2] - goal1) < 0.3
             println("Evader reached goal at step $i. Stopping simulation.")
             break
         end
 
-        # --- Nominal Controller for Evader ---
-        error1 = goal - evader.state[1:2]
+        # --- Nominal Controllers (Output desired v_ref and w) ---
+        # Nominal Controller for Vehicle 1 (Evader)
+        error1 = goal1 - state1[1:2]
         angle_to_goal1 = atan(error1[2], error1[1])
-        psi_error1 = atan(sin(angle_to_goal1 - evader.state[3]), cos(angle_to_goal1 - evader.state[3]))
-        a_n1 = 0.5 * (evader.v_max - evader.state[4])
+        psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
+        v_n1 = V_MAX_1 # Command max speed
         w_n1 = 2.0 * psi_error1
-        u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
+        u_n1 = clamp.([v_n1, w_n1], [0.0, W_MIN], [V_MAX_1, W_MAX])
+
+        # --- Nominal Controller for Vehicle 2 (Pursuer) with Intercept Logic ---
+        # Predict evader's future position based on its current velocity
+        p1_current = state1[1:2]
+        v1_current_vec = state1[4] * [cos(state1[3]), sin(state1[3])]
+        goal2 = p1_current + v1_current_vec * T_PREDICT # The intercept point
+        push!(hist_intercept_points, goal2) # Store for visualization
+
+        # The rest of the pursuer's controller uses this new intercept point as the goal
+        error2 = goal2 - state2[1:2]
+        angle_to_goal2 = atan(error2[2], error2[1])
+        psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
+        v_n2 = V_MAX_2 # Command max speed
+        w_n2 = 2.0 * psi_error2
+        u_n2 = clamp.([v_n2, w_n2], [0.0, W_MIN], [V_MAX_2, W_MAX])
 
 
-        for p in pursuers
-            goal_p = evader.state[1:2] # Pursuer's goal == evader
-            error_p = goal_p - p.state[1:2]
-            angle_to_goal_p = atan(error_p[2], error_p[1])
-            psi_error_p = atan(sin(angle_to_goal_p - p.state[3]), cos(angle_to_goal_p - p.state[3]))
-            a_np = 0.5 * (p.v_max - p.state[4])
-            w_np = 2.0 * psi_error_p
-            p.control = clamp.([a_np, w_np], [A_MIN, W_MIN], [A_MAX, W_MAX])
-        end
+        # --- Integral Higher-Order CBF-QP Safety Filter ---
 
-        # --- CBF-QP Safety Filter for the EVADER ONLY ---
-        A_cbf = Matrix{Float64}(undef, num_pursuers, 2)
-        b_cbf_lower = Vector{Float64}(undef, num_pursuers)
+        # Extract states for clarity
+        p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
+        p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
 
-        for (j, p) in enumerate(pursuers)
-            p1 = evader.state[1:2]; psi1 = evader.state[3]; v1 = evader.state[4]
-            p2 = p.state[1:2]; psi2 = p.state[3]; v2 = p.state[4]
-            
-            delta_p = p1 - p2
-            v1_vec = v1 * [cos(psi1), sin(psi1)]
-            v2_vec = v2 * [cos(psi2), sin(psi2)]
-            delta_v = v1_vec - v2_vec
+        # Calculate relative vectors
+        delta_p = p1 - p2
+        v1_vec = v1 * [cos(psi1), sin(psi1)]
+        v2_vec = v2 * [cos(psi2), sin(psi2)]
+        delta_v = v1_vec - v2_vec
 
-            h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
-            h_dot = 2 * dot(delta_p, delta_v)
-            
-            v2_dot_vec = p.control[1]*[cos(psi2),sin(psi2)] + p.control[2]*v2*[-sin(psi2),cos(psi2)]
-            
-            Lfh_j = 2*dot(delta_v,delta_v) - 2*dot(delta_p, v2_dot_vec) + K1*h_dot + K2*h
-            
-            g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
-            g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
-            
-            A_cbf[j, :] = [g_a1 g_w1]
-            b_cbf_lower[j] = -Lfh_j
-        end
+        # CBF function (h) and its time derivative (h_dot)
+        h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
+        h_dot = 2 * dot(delta_p, delta_v) # This is L_f h
 
-        # QP formulation for the evader's control u1 = [a1, w1]
-        H = diagm([20.0, 0.1])
+        # --- Integral Term Update ---
+        psi_1 = h_dot + K1 * h
+        sigma_dot = -K_I * sigma - psi_1
+        sigma = sigma + sigma_dot * DT # Euler integration
+
+        # --- QP Constraint Formulation (A_cbf * u >= b_cbf_lower) ---
+        L_f2_h = 2*dot(delta_v, delta_v) - 2*K_v*v1*dot(delta_p, [cos(psi1),sin(psi1)]) + 2*K_v*v2*dot(delta_p, [cos(psi2),sin(psi2)])
+        g_v_ref1 = 2 * K_v * dot(delta_p, [cos(psi1), sin(psi1)])
+        g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
+        g_v_ref2 = -2 * K_v * dot(delta_p, [cos(psi2), sin(psi2)])
+        g_w2 = -2 * v2 * dot(delta_p, [-sin(psi2), cos(psi2)])
+        A_cbf = [g_v_ref1 g_w1 g_v_ref2 g_w2] 
+        b_cbf_lower = -L_f2_h - (K1 + K2 - 1)*h_dot - (K1*K2 - K1)*h - (K2 - K_I)*sigma
+
+        # --- QP Formulation ---
+        H = diagm([1.0, 0.1, 1.0, 0.1])
         P = sparse(H * 2.0)
-        q = -2.0 * H * u_n1
-        
-        A = sparse([A_cbf; I])
-        l = [b_cbf_lower; A_MIN; W_MIN]
-        u = [fill(Inf, num_pursuers); A_MAX; W_MAX]
+        q = -2.0 * H * [u_n1; u_n2]
+        A = sparse([A_cbf; I(4)])
+        l = [b_cbf_lower; 0.0; W_MIN; 0.0; W_MIN]
+        u = [Inf; V_MAX_1; W_MAX; V_MAX_2; W_MAX]
         
         model = OSQP.Model()
         OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
         
-        u1_safe = u_n1
+        u_safe = [u_n1; u_n2] # Default to nominal if solver fails
         if results.info.status == :Solved
-            u1_safe = results.x
+            u_safe = results.x
         else
-            println("Warning: QP not solved at step $i for evader. Using nominal control.")
+            println("Warning: QP not solved at step $i. Status: $(results.info.status). Using nominal control.")
         end
-        evader.control = u1_safe
 
-        # --- Update All States ---
-        evader.state .+= vehicle_dynamics(evader.state, evader.control) * DT
-        evader.state[4] = clamp(evader.state[4], 0.0, evader.v_max)
+        u1_safe = u_safe[1:2] # [v_ref1, w1]
+        u2_safe = u_safe[3:4] # [v_ref2, w2]
+
+        # --- Update State and Store History ---
+        a1 = K_v * (u1_safe[1] - state1[4])
+        a2 = K_v * (u2_safe[1] - state2[4])
+        state1_dot = [state1[4] * cos(state1[3]), state1[4] * sin(state1[3]), u1_safe[2], a1]
+        state2_dot = [state2[4] * cos(state2[3]), state2[4] * sin(state2[3]), u2_safe[2], a2]
+        state1 = state1 + state1_dot * DT
+        state2 = state2 + state2_dot * DT 
         
-        for p in pursuers
-            p.state .+= vehicle_dynamics(p.state, p.control) * DT
-            p.state[4] = clamp(p.state[4], 0.0, p.v_max)
-        end
-        
-        # --- Store History ---
-        push!(evader.hist_state, evader.state)
-        push!(evader.hist_control, evader.control)
-        for p in pursuers
-            push!(p.hist_state, p.state)
-            push!(p.hist_control, p.control)
-        end
+        push!(hist_state1, state1)
+        push!(hist_state2, state2)
+        push!(hist_control1, u1_safe)
+        push!(hist_control2, u2_safe)
+        push!(hist_cbf, (h=h, h_dot=h_dot, sigma=sigma))
     end
 
     println("Simulation finished.")
-    return evader, pursuers, goal
+    return hist_state1, hist_state2, hist_control1, hist_control2, hist_cbf, hist_intercept_points
 end
 
 
-function plot_and_animate(evader, pursuers, goal)
+#==============================================================================
+# PLOTTING AND ANIMATION
+==============================================================================#
+function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2, hist_cbf, hist_intercept_points)
     println("Generating plots and animation...")
     
-    num_steps_run = length(evader.hist_state) - 1
+    num_steps_run = length(hist_state1) - 1
+    # Create separate time axes for states (N+1 points) and controls (N points)
     time_axis_states = 0:DT:(num_steps_run * DT)
     time_axis_controls = 0:DT:((num_steps_run-1) * DT)
+
+    x1_hist = [s[1] for s in hist_state1]; y1_hist = [s[2] for s in hist_state1]
+    v1_hist = [s[4] for s in hist_state1]
+    
+    x2_hist = [s[1] for s in hist_state2]; y2_hist = [s[2] for s in hist_state2]
+    v2_hist = [s[4] for s in hist_state2]
+
+    # Extract control histories, skipping the initial dummy value
+    v_ref1_hist = [c[1] for c in hist_control1[2:end]]
+    w1_hist = [c[2] for c in hist_control1[2:end]]
+    v_ref2_hist = [c[1] for c in hist_control2[2:end]]
+    w2_hist = [c[2] for c in hist_control2[2:end]]
+
+    h_hist = [c.h for c in hist_cbf]; sigma_hist = [c.sigma for c in hist_cbf]
+
+    goal1_pos = [10.0, 1.0]
     theta = 0:0.1:(2*pi+0.1)
 
-    # --- Generate Static Plots ---
-    p_traj = plot(
-        [s[1] for s in evader.hist_state], [s[2] for s in evader.hist_state],
-        label="Evader Path", lw=2, aspect_ratio=:equal,
-        xlabel="x [m]", ylabel="y [m]", title="Vehicle Trajectories"
-    )
-    for (i, p) in enumerate(pursuers)
-        plot!(p_traj, [s[1] for s in p.hist_state], [s[2] for s in p.hist_state], label="Pursuer $i Path", lw=2)
-    end
-    scatter!(p_traj, [goal[1]], [goal[2]], label="Goal", marker=:xcross, markersize=8, color=:green)
+    # --- Generate Static Plots for Analysis ---
+    p_traj = plot(x1_hist, y1_hist, label="V1 Path (Evader)", lw=2, aspect_ratio=:equal,
+                  xlabel="x [m]", ylabel="y [m]", title="Vehicle Trajectories")
+    plot!(p_traj, x2_hist, y2_hist, label="V2 Path (Pursuer)", lw=2)
+    scatter!(p_traj, [goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
 
-    p_vel = plot(time_axis_states, [s[4] for s in evader.hist_state], label="Evader", lw=2, title="Velocity Profiles", xlabel="Time [s]")
-    for (i, p) in enumerate(pursuers)
-        plot!(p_vel, time_axis_states, [s[4] for s in p.hist_state], label="Pursuer $i", lw=2)
-    end
+    p_cbf = plot(time_axis_states, h_hist, label="h(x)", lw=2, title="i-HOCBF State", xlabel="Time [s]", ylabel="Value")
+    plot!(p_cbf, time_axis_states, sigma_hist, label="sigma(t)", lw=2)
+    hline!(p_cbf, [0], lw=1, ls=:dash, color=:black, label="")
+
+    p_vel = plot(time_axis_states, v1_hist, label="V1 Actual", lw=2, c=:blue, title="Linear Velocity", xlabel="Time [s]", ylabel="Velocity [m/s]")
+    plot!(p_vel, time_axis_controls, v_ref1_hist, label="V1 Ref", lw=2, ls=:dash, c=:lightblue)
+    plot!(p_vel, time_axis_states, v2_hist, label="V2 Actual", lw=2, c=:red)
+    plot!(p_vel, time_axis_controls, v_ref2_hist, label="V2 Ref", lw=2, ls=:dash, c=:orange)
     
-    p_rot = plot(time_axis_controls, [c[2] for c in evader.hist_control[2:end]], label="Evader", lw=2, title="Rotational Speeds", xlabel="Time [s]")
-     for (i, p) in enumerate(pursuers)
-        plot!(p_rot, time_axis_controls, [c[2] for c in p.hist_control[2:end]], label="Pursuer $i", lw=2)
-    end
+    p_w = plot(time_axis_controls, w1_hist, label="V1 (Evader)", lw=2, title="Angular Velocity Control", xlabel="Time [s]", ylabel="w [rad/s]")
+    plot!(p_w, time_axis_controls, w2_hist, label="V2 (Pursuer)", lw=2)
 
-    static_plot = plot(p_traj, p_vel, p_rot, layout=(1,3), size=(1800, 500))
-    plot_path = "cbf_analysis_plots_two_pursuers.png"
+    static_plot = plot(p_traj, p_cbf, p_vel, p_w, layout=(2,2), size=(1200, 800), legend=:bottomleft)
+    
+    plot_path = "ihocbf_intercept_analysis.png"
     savefig(static_plot, plot_path)
     println("Analysis plots saved to $plot_path")
 
 
-    anim = @animate for i in 1:length(evader.hist_state)
-        plot(xlims=(-15, 15), ylims=(-15, 15), aspect_ratio=:equal,
-             xlabel="x [m]", ylabel="y [m]", title="Two-Pursuer Evasion (Frame $i)")
+    # --- Generate Animation ---
+    anim = @animate for i in 1:length(hist_intercept_points)
+        p_anim = plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
+             xlims=(-12, 12), ylims=(-6, 6),
+             xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion with Intercept Logic (Frame $i)")
+        plot!(p_anim, x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
 
-        # Plot Evader
-        plot!([s[1] for s in evader.hist_state[1:i]], [s[2] for s in evader.hist_state[1:i]], label="Evader Path", lw=2, color=:blue)
-        plot!([evader.hist_state[i][1]] .+ R_AGENT .* cos.(theta), [evader.hist_state[i][2]] .+ R_AGENT .* sin.(theta),
-              seriestype=:shape, fillalpha=0.3, lw=0, label="Evader", color=:blue)
-        
-        # Plot Pursuers
-        for (j, p) in enumerate(pursuers)
-            plot!([s[1] for s in p.hist_state[1:i]], [s[2] for s in p.hist_state[1:i]], label="P$j Path", lw=2)
-            plot!([p.hist_state[i][1]] .+ R_AGENT .* cos.(theta), [p.hist_state[i][2]] .+ R_AGENT .* sin.(theta),
-                  seriestype=:shape, fillalpha=0.3, lw=0, label="P$j", color=:orange)
-        end
+        plot!(p_anim, x1_hist[i] .+ R_AGENT .* cos.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1", color=:blue)
+        plot!(p_anim, x2_hist[i] .+ R_AGENT .* cos.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 2", color=:orange)
               
-        # Plot the goal
-        scatter!([goal[1]], [goal[2]], label="Goal", marker=:xcross, markersize=8, color=:green)
+        scatter!(p_anim, [goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
+        
+        # Plot the current intercept point
+        intercept_pt = hist_intercept_points[i]
+        scatter!(p_anim, [intercept_pt[1]], [intercept_pt[2]], label="Intercept Pt.", marker=:star5, markersize=6, color=:magenta)
+        
+        h_val_current = hist_cbf[i].h
+        annotate!(p_anim, -11, 5, text("h(x) = $(round(h_val_current, digits=2))", :left, 10))
     end
 
-    gif_path = "cbf_simulation_two_pursuers.gif"
+    gif_path = "ihocbf_intercept_simulation.gif"
     gif(anim, gif_path, fps = 15)
     println("Animation saved to $gif_path")
 end
 
 
-# --- Run Simulation and Generate GIF ---
-evader, pursuers, goal = run_simulation()
-plot_and_animate(evader, pursuers, goal)
+#==============================================================================
+# MAIN EXECUTION
+==============================================================================#
+hist_state1, hist_state2, hist_control1, hist_control2, hist_cbf, hist_intercept_points = run_simulation()
+plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2, hist_cbf, hist_intercept_points)
 
 println("Script finished. Press Enter to exit...")
 readline()
