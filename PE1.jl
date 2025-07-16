@@ -88,7 +88,7 @@ function run_simulation()
     hist_state1 = [state1]
     hist_control1 = [[0.0, 0.0]]
 
-    # Vehicle 2 (Pursuer): Starts on the right, goal is Vehicle 1
+    # Vehicle 2 (Pursuer): Starts on the right, goal is point of interception
     state2 = [5.0, -1.0, pi, V_MAX_2]
     hist_state2 = [state2]
     hist_control2 = [[0.0, 0.0]]
@@ -165,7 +165,8 @@ function run_simulation()
         A_cbf = [g_a1 g_w1 g_a2 g_w2] 
         b_cbf_lower = -Lfh
 
-        H = diagm([20.0, 0.1, 20.0, 0.1])
+        H = diagm([20.0, 0.1, #Weights for evader acceleration, angular velocity, respectively
+                20.0, 0.1])
         P = sparse(H * 2.0)
         q = -2.0 * H * [u_n1; u_n2]
         A = sparse([A_cbf; I(4)])
@@ -245,7 +246,7 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2
     savefig(static_plot, plot_path)
     println("Analysis plots saved to $plot_path")
 
-    anim = @animate for i in 1:length(interceptionHist)
+    anim = @animate for i in 1:lastindex(interceptionHist)
         p_anim = plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
              xlims=(-12, 12), ylims=(-6, 6),
              xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion with CBF (Frame $i)")
