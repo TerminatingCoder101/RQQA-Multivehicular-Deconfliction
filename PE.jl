@@ -114,12 +114,43 @@ function run_simulation()
         # --- Nominal Controller for Vehicle 1 (Evader) ---
         error1 = goal1 - state1[1:2]
         dist_to_goal = norm(error1)
-        angle_to_goal1 = atan(error1[2], error1[1])
-        psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
+        dist_to_pursuer = norm(state1[1:2] - state2[1:2])
+        
+        # --- FIX: Implement smarter blended heading logic ---
+        angle_to_goal = atan(error1[2], error1[1])
+        final_angle_command = angle_to_goal
+
+        # Check if the pursuer is a frontal threat
+        vec_evader_fwd = [cos(state1[3]), sin(state1[3])]
+        vec_evader_to_pursuer = normalize(state2[1:2] - state1[1:2])
+        dot_product = dot(vec_evader_fwd, vec_evader_to_pursuer)
+
+        # Only consider evasion if the pursuer is in front (dot_product > 0) and within the threat radius
+        if dist_to_pursuer < D_THREAT && dot_product > 0
+            # Create a blended heading command if threatened
+            vec_to_goal = normalize(error1)
+            vec_away_from_pursuer = normalize(state1[1:2] - state2[1:2])
+            
+            # Weight evasive action based on proximity
+            evasive_weight = 1.0 - (dist_to_pursuer / D_THREAT)
+            
+            # Combine vectors: more weight to evasion as pursuer gets closer
+            desired_direction_vec = (1.0 - evasive_weight) * vec_to_goal + evasive_weight * vec_away_from_pursuer
+            final_angle_command = atan(desired_direction_vec[2], desired_direction_vec[1])
+        end
+        
+        psi_error1 = atan(sin(final_angle_command - state1[3]), cos(final_angle_command - state1[3]))
+
+        # Speed logic
         v_goal_based = 0.9 * dist_to_goal
         v_turn_based = V_MAX_1 * (1.0 - 0.5 * abs(psi_error1) / pi)
-        dist_to_pursuer = norm(state1[1:2] - state2[1:2])
-        v_evasive = dist_to_pursuer < D_THREAT ? V_MAX_1 * (dist_to_pursuer / D_THREAT) : V_MAX_1
+        v_evasive = V_MAX_1 # Default to max speed
+        
+        # Only slow down for frontal threats
+        if dist_to_pursuer < D_THREAT && dot_product > 0
+            v_evasive = V_MAX_1 * (dist_to_pursuer / D_THREAT)
+        end
+
         v_desired = min(v_goal_based, v_turn_based, v_evasive)
         a_n1 = 0.5 * (v_desired - state1[4])
         w_n1 = 2.0 * psi_error1
@@ -133,18 +164,13 @@ function run_simulation()
         angle_to_goal2 = atan(error2[2], error2[1])
         psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
         
-        # FIX: Implement "Brake to Turn" logic
         w_n2 = 8.0 * psi_error2 # Command an aggressive turn
-        
-        # If the turn is sharp (e.g., > 45 degrees), command max braking.
-        # Otherwise, accelerate towards the target speed.
         if abs(psi_error2) > pi / 4.0
             a_n2 = A_MIN
         else
             v_desired_2 = V_MAX_2 * (1.0 - 0.7 * abs(psi_error2) / pi)
             a_n2 = 0.5 * (v_desired_2 - state2[4])
         end
-
         u_n2 = clamp.([a_n2, w_n2], [A_MIN, W_MIN], [A_MAX, W_MAX])
 
         # --- Second-Order CBF-QP Safety Filter ---

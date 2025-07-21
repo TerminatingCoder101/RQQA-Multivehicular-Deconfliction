@@ -173,3 +173,19 @@ plot_test_animation(hist_state1, hist_state2, initial_intercept_pt, dynamic_inte
 
 println("Script finished. Press Enter to exit...")
 readline()
+
+
+# Dubins vs dynamic speed -- stationary obstacle
+# Vehicles exchanging places
+
+# Stationary -- for fundamental understanding
+# Pursuer evader for proof of concept
+# Multivehicular pe for reality proof
+
+# Two go to the right
+# Three going to the left 
+
+
+
+
+# Get rid of pursuer evasion -- not necessary for this one 

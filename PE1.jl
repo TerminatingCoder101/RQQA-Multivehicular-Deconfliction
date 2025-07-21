@@ -20,7 +20,7 @@ function vehicle_dynamics(state, control)
 end
 
 const DT = 0.1 
-const T_MAX = 25.0
+const T_MAX = 30.0
 const N_STEPS = Int(T_MAX / DT)
 
 const R_AGENT = 0.5
@@ -107,6 +107,7 @@ function run_simulation()
         end
 
         # --- Nominal Controller for Vehicle 1 (Evader) ---
+
         error1 = goal1 - state1[1:2]
         dist_to_goal = norm(error1)
         angle_to_goal1 = atan(error1[2], error1[1])
@@ -124,7 +125,7 @@ function run_simulation()
             v_evasive = V_MAX_1 * (dist_to_pursuer / D_THREAT)
         end
         
-        v_desired = min(v_turn_based, v_evasive)
+        v_desired = min(v_turn_based)
         a_n1 = 0.5 * (v_desired - state1[4])
         
         w_n1 = 2.0 * psi_error1
@@ -156,29 +157,37 @@ function run_simulation()
         push!(hist_h, h)
         push!(hist_h_dot, h_dot)
 
-        Lfh = 2*dot(delta_v, delta_v) + K1*h_dot + K2*h
+        function get_b_cbf(u_pursuer)
+            a2,w2 = u_pursuer
+            a2_vec = a2 * [cos(psi2), sin(psi2)] - v2 * w2 * [sin(psi2), -cos(psi2)]
+            Lfh = 2*dot(delta_v, delta_v) + 2*dot(delta_p, -a2_vec) + K1*h_dot + K2*h
+            return -Lfh
+        end
+        
         g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
         g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
-        g_a2 = -2 * dot(delta_p, [cos(psi2), sin(psi2)])
-        g_w2 = -2 * v2 * dot(delta_p, [-sin(psi2), cos(psi2)])
 
-        A_cbf = [g_a1 g_w1 g_a2 g_w2] 
-        b_cbf_lower = -Lfh
+        u2_left = [a_n2, W_MAX]
+        u2_straight = [a_n2, 0.0]
+        u2_right = [a_n2, W_MIN]
 
-        H = diagm([20.0, 0.1, #Weights for evader acceleration, angular velocity, respectively
-                20.0, 0.1])
+        A_cbf = [g_a1 g_w1; g_a1 g_w1; g_a1 g_w1]
+        b_cbf_lower = [get_b_cbf(u2_left); get_b_cbf(u2_straight); get_b_cbf(u2_right)]
+
+        H = diagm([20.0, 0.1])
         P = sparse(H * 2.0)
-        q = -2.0 * H * [u_n1; u_n2]
-        A = sparse([A_cbf; I(4)])
-        l = [b_cbf_lower; A_MIN; W_MIN; A_MIN; W_MIN]
-        u = [Inf; A_MAX; W_MAX; A_MAX; W_MAX]
+        q = -2.0 * H * u_n1
+        A = sparse([A_cbf; I(2)])
+        l = [b_cbf_lower; A_MIN; W_MIN]
+        u = [Inf; Inf; Inf; A_MAX; W_MAX]
 
         model = OSQP.Model()
         OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
-        u_safe = results.info.status == :Solved ? results.x : [u_n1; u_n2]
-        u1_safe = u_safe[1:2]
-        u2_safe = u_safe[3:4]
+
+        u1_safe = results.info.status == :Solved ? results.x : u_n1
+        u2_safe = u_n2 
+
         state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
         state1[4] = clamp(state1[4], 0.0, V_MAX_1)
         state2 = state2 + vehicle_dynamics(state2, u2_safe) * DT 
@@ -269,3 +278,22 @@ plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2, hist_h,
 
 println("Script finished. Press Enter to exit...")
 readline()
+
+
+
+
+
+# Dubins vs dynamic speed -- stationary obstacle
+# Vehicles exchanging places
+
+# Stationary -- for fundamental understanding
+# Pursuer evader for proof of concept
+# Multivehicular pe for reality proof
+
+# Two go to the right
+# Three going to the left 
+
+
+
+
+# Get rid of pursuer evasion -- not necessary for this one 
