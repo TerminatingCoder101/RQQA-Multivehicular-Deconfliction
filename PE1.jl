@@ -19,7 +19,7 @@ function vehicle_dynamics(state, control)
     return [x_dot, y_dot, psi_dot, v_dot]
 end
 
-const DT = 0.1 
+const DT = 0.1
 const T_MAX = 30.0
 const N_STEPS = Int(T_MAX / DT)
 
@@ -116,14 +116,7 @@ function run_simulation()
         # Implementing 2 different types of speed bases 
         # Speed is determined by turning. Sharper turn = slower speed, and vice versa
         v_turn_based = V_MAX_1 * (1.0 - 0.5 * abs(psi_error1) / pi)
-        # Speed slows down if pursuer is near to make sharper turns 
-        dist_to_pursuer = norm(state1[1:2] - state2[1:2])
-        v_evasive = V_MAX_1 # Default to max speed
-
-        if dist_to_pursuer < D_THREAT
-            # If threatened, scale speed down linearly from max to 0
-            v_evasive = V_MAX_1 * (dist_to_pursuer / D_THREAT)
-        end
+ 
         
         v_desired = min(v_turn_based)
         a_n1 = 0.5 * (v_desired - state1[4])
