@@ -1,0 +1,385 @@
+using OSQP
+using Plots
+using LinearAlgebra
+using SparseArrays
+using Printf
+
+
+# -- Vehicle Dynamics Model --
+# state = [x, y, psi, v], control = [a, w]
+function vehicle_dynamics(state, control)
+    x, y, psi, v = state
+    a, w = control
+    return [v * cos(psi), v * sin(psi), w, a]
+end
+
+# -- Simulation & Agent Parameters --
+const DT = 0.1
+const T_MAX = 25.0
+const N_STEPS = Int(T_MAX / DT)
+const R_AGENT = 0.5
+const COLLISION_DISTANCE = 0.5*R_AGENT
+const D_MIN_TOTAL = 1.5 * R_AGENT + 1.0
+
+# -- Shared Control Limits --
+const V_MAX_1 = 4.75
+const V_MAX_2 = 2.75
+const N_MAX = 15
+const A_MIN, A_MAX = -2.0, 2.0
+const W_MIN, W_MAX = -pi, pi
+
+# -- Utility for Interception Calculation (Used in Strategy 1) --
+
+function calc_intercept_pt(state1, state2)
+    p1 = state1[1:2]
+    psi1 = state1[3]
+    v1 = state1[4]
+
+    p2 = state2[1:2]
+    v2 = V_MAX_2
+
+    delta_p = p1 - p2
+    v1_vec = v1 * [cos(psi1), sin(psi1)]
+
+    # Quadratic equation coefficients for time-to-intercept 't'
+    # (v1^2 - v2^2)t^2 + (2*dot(delta_p, v1_vec))t + norm(delta_p)^2 = 0
+    a = dot(v1_vec, v1_vec) - v2^2
+    b = 2 * dot(delta_p, v1_vec)
+    c = dot(delta_p, delta_p)
+
+    discriminant = b^2 - 4*a*c
+    if discriminant < 0
+        # No real solution, pursuer cannot intercept. Aim further
+        return p1 + v1_vec * 0.1
+    end
+
+    t1 = (-b + sqrt(discriminant)) / (2a)
+    t2 = (-b - sqrt(discriminant)) / (2a)
+
+    t = -1.0
+    if t1 > 0 && t2 > 0
+        t = min(t1, t2)
+    elseif t1 > 0
+        t = t1
+    elseif t2 > 0
+        t = t2
+    else
+        # No positive time solution, aim ahead
+        return p1 + v1_vec * 0.1
+    end
+
+    return p1 + v1_vec * t
+end
+
+
+# --- STRATEGY 1: Evader-Centric QP (Predicts Pursuer Moves) ---
+function run_simulation_strategy1(K1, K2)
+    interceptionHist =[]
+
+   # Vehicle 1 (Evader): Starts on the left, goal is on the right
+    state1 = [-10.0, 1.0, 0.0, V_MAX_1]
+    goal1 = [10.0, 1.0]
+    hist_state1 = [state1]
+    hist_control1 = [[0.0, 0.0]]
+
+    # Vehicle 2 (Pursuer): Starts on the right, goal is point of interception
+    state2 = [10.0, -1.0, pi, V_MAX_2]
+    hist_state2 = [state2]
+    hist_control2 = [[0.0, 0.0]]
+
+    println("Starting simulation...")
+
+    hist_h = Float64[]
+    hist_h_dot = Float64[]
+
+    # Simulation Loop
+    for i in 1:N_STEPS
+        # Check if the goal has been reached or not
+        if norm(state1[1:2] - goal1) < 0.3
+            println("Evader reached goal at step $i. Stopping simulation.")
+            break
+        end
+
+        # --- Nominal Controller for Vehicle 1 (Evader) ---
+
+        error1 = goal1 - state1[1:2]
+        dist_to_goal = norm(error1)
+        angle_to_goal1 = atan(error1[2], error1[1])
+        psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
+
+        # Speed is determined by turning. Sharper turn = slower speed, and vice versa
+        v_turn_based = V_MAX_1 * (1.0 - 0.5 * abs(psi_error1) / pi)
+         
+        v_desired = min(v_turn_based)
+        a_n1 = 0.5 * (v_desired - state1[4])
+        
+        w_n1 = 2.0 * psi_error1
+        u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
+
+        # --- Nominal Controller for Vehicle 2 (Pursuer) ---
+
+        interceptionPt = calc_intercept_pt(state1, state2)
+        push!(interceptionHist, interceptionPt) # Store the calculated point
+        goal2 = interceptionPt
+        error2 = goal2 - state2[1:2]
+        angle_to_goal2 = atan(error2[2], error2[1])
+        psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
+
+        v_desired_2 = V_MAX_2 * (1.0 - 0.7 * abs(psi_error2) / pi)
+        a_n2 = 0.5 * (v_desired_2 - state2[4])
+        w_n2 = 2.0 * psi_error2
+        u_n2 = clamp.([a_n2, w_n2], [A_MIN, W_MIN], [A_MAX, W_MAX])
+
+        # --- Second-Order CBF-QP Safety Filter ---
+        p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
+        p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
+        delta_p = p1 - p2
+        v1_vec = v1 * [cos(psi1), sin(psi1)]
+        v2_vec = v2 * [cos(psi2), sin(psi2)]
+        delta_v = v1_vec - v2_vec
+        
+        h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
+        h_dot = 2 * dot(delta_p, delta_v)
+        push!(hist_h, h)
+        push!(hist_h_dot, h_dot)
+
+        function get_b_cbf(u_pursuer)
+            a2,w2 = u_pursuer
+            a2_vec = a2 * [cos(psi2), sin(psi2)] - v2 * w2 * [sin(psi2), -cos(psi2)]
+            Lfh = 2*dot(delta_v, delta_v) + 2*dot(delta_p, -a2_vec) + K1*h_dot + K2*h
+            return -Lfh
+        end
+        
+        g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
+        g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
+
+        u2_left = [a_n2, W_MAX]
+        u2_straight = [a_n2, 0.0]
+        u2_right = [a_n2, W_MIN]
+
+        A_cbf = [g_a1 g_w1; g_a1 g_w1; g_a1 g_w1]
+        b_cbf_lower = [get_b_cbf(u2_left); get_b_cbf(u2_straight); get_b_cbf(u2_right)]
+
+        H = diagm([20.0, 0.1])
+        P = sparse(H * 2.0)
+        q = -2.0 * H * u_n1
+        A = sparse([A_cbf; I(2)])
+        l = [b_cbf_lower; A_MIN; -N_MAX/state1[4]]
+        u = [Inf; Inf; Inf; A_MAX; N_MAX/state1[4]]
+
+        model = OSQP.Model()
+        OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
+        results = OSQP.solve!(model)
+
+        if results.info.status == :Solved
+            u1_safe = results.x
+        else
+            println("Warning: QP not solved at step $i. Evader using nominal control.")
+        end
+        
+
+        u1_safe = results.info.status == :Solved ? results.x : u_n1
+        u2_safe = u_n2 
+
+        state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
+        state1[4] = clamp(state1[4], 0.0, V_MAX_1)
+        state2 = state2 + vehicle_dynamics(state2, u2_safe) * DT 
+        state2[4] = clamp(state2[4], 0.0, V_MAX_2)
+        push!(hist_state1, state1)
+        push!(hist_state2, state2)
+    end 
+    return hist_state1, hist_state2
+end
+
+# --- STRATEGY 2: Shared Responsibility QP ---
+function run_simulation_strategy2(K1, K2)
+   
+    # -- Initial Conditions --
+    # Vehicle 1 (Evader): Starts on the left, goal is on the right
+    state1 = [-10.0, 1.0, 0.0, V_MAX_1] # Start from rest
+    goal1 = [10.0, 1.0]
+    hist_state1 = [state1]
+    hist_control1 = [[0.0, 0.0]]
+
+    # Vehicle 2 (Pursuer): Starts on the right, goal is Vehicle 1
+    state2 = [10.0, -1.0, pi, V_MAX_2] # Start at max speed
+    hist_state2 = [state2]
+    hist_control2 = [[0.0, 0.0]]
+
+    # -- Simulation Loop --
+    for i in 1:N_STEPS
+        # Check if the evader has reached its goal
+        if norm(state1[1:2] - goal1) < 0.3
+            println("Evader reached goal at step $i. Stopping simulation.")
+            break
+        end
+
+        # Nominal Controller for Vehicle 1 (Evader) - seeks its goal
+        error1 = goal1 - state1[1:2]
+        angle_to_goal1 = atan(error1[2], error1[1])
+        psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
+        a_n1 = 0.5 * (V_MAX_1 - state1[4]) # Accelerate to max speed
+        w_n1 = 2.0 * psi_error1
+        u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
+
+        # Nominal Controller for Vehicle 2 (Pursuer) - aggressively tracks evader
+        goal2 = state1[1:2] # Pursuer's goal is always the evader's current position
+        error2 = goal2 - state2[1:2]
+        angle_to_goal2 = atan(error2[2], error2[1])
+        psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
+        a_n2 = 0.5 * (V_MAX_2 - state2[4])
+        w_n2 = 2.0 * psi_error2
+        u_n2 = clamp.([a_n2, w_n2], [A_MIN, W_MIN], [A_MAX, W_MAX])
+
+
+        p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
+        p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
+
+        delta_p = p1 - p2
+        v1_vec = v1 * [cos(psi1), sin(psi1)]
+        v2_vec = v2 * [cos(psi2), sin(psi2)]
+        delta_v = v1_vec - v2_vec
+
+        h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
+        h_dot = 2 * dot(delta_p, delta_v)
+        
+        g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
+        g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
+        
+        a2_vec = u_n2[1] * [cos(psi2), sin(psi2)] - v2 * u_n2[2] * [sin(psi2), -cos(psi2)]
+        
+        h_ddot_fixed_part = 2*dot(delta_v, delta_v) + 2*dot(delta_p, -a2_vec)
+        
+        b_cbf_lower = -(h_ddot_fixed_part + K1*h_dot + K2*h)
+
+        H = diagm([20.0, 0.1])
+        P = sparse(H * 2.0)
+
+        
+        # Define constraints for the QP
+        # A_cbf * u1 >= b_cbf_lower
+        A_cbf = [g_a1 g_w1]
+        
+        A = sparse([A_cbf; I(2)])
+        l = [b_cbf_lower; A_MIN; W_MIN]
+        u = [Inf; A_MAX; W_MAX]
+        
+        model = OSQP.Model()
+        OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
+        results = OSQP.solve!(model)
+        
+        # -- Step 3: Determine Final Control Inputs --
+        u1_safe = u_n1 # Default to nominal if solver fails
+        if results.info.status == :Solved
+            u1_safe = results.x
+        else
+            println("Warning: QP not solved at step $i. Evader using nominal control.")
+        end
+        
+        u2_safe = u_n2
+
+        # -- Step 4: Update State and Store History --
+        state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
+        state1[4] = clamp(state1[4], 0.0, V_MAX_1)
+        
+        state2 = state2 + vehicle_dynamics(state2, u2_safe) * DT 
+        state2[4] = clamp(state2[4], 0.0, V_MAX_2)
+        
+        push!(hist_state1, state1)
+        push!(hist_state2, state2)
+    end
+    return hist_state1, hist_state2
+end
+
+# -- Analysis Function --
+function analyze_run(hist_state1, hist_state2)
+    min_dist = Inf
+    for i in 1:length(hist_state1)
+        dist = norm(hist_state1[i][1:2] - hist_state2[i][1:2])
+        if dist < min_dist
+            min_dist = dist
+        end
+    end
+    
+    goal1 = [10.0, 1.0]
+    evasion_successful = min_dist > COLLISION_DISTANCE
+    goal_reached = norm(hist_state1[end][1:2] - goal1) < 0.3
+    time_to_goal = (length(hist_state1) - 1) * DT
+
+    return (min_dist=min_dist, success=evasion_successful, goal=goal_reached, time=time_to_goal)
+end
+
+# -- Main Execution and Parameter Sweep --
+function find_best_parameters()
+    # Define the search space for K parameters
+    K1_range = 1.0:1.0:6.0
+    K2_range = 1.0:1.0:6.0
+    
+    best_params = nothing
+    best_perf_margin = -Inf # Performance margin: Time_S2 - Time_S1
+
+    println("--- Starting Parameter Sweep for K1 and K2 ---")
+    println("Goal: Find K values where Strategy 1 (Evader-QP) succeeds and is better than Strategy 2 (Shared-QP).\n")
+    @printf "%-10s %-10s | %-25s | %-25s | %s\n" "K1" "K2" "Strategy 1 Result" "Strategy 2 Result" "Comment"
+    println("-"^90)
+
+    for K1 in K1_range
+        for K2 in K2_range
+            # Run both simulations with the same K values
+            hist1_s1, hist2_s1 = run_simulation_strategy1(K1, K2)
+            res1 = analyze_run(hist1_s1, hist2_s1)
+
+            hist1_s2, hist2_s2 = run_simulation_strategy2(K1, K2)
+            res2 = analyze_run(hist1_s2, hist2_s2)
+
+            # --- Comparison Logic ---
+            comment = ""
+            is_candidate = false
+            if res1.success && res1.goal && !res2.success
+                comment = "✅ S1 SUCCESS, S2 FAILED"
+                is_candidate = true
+            elseif res1.success && res1.goal && res2.success && res2.goal
+                # If both succeed, is S1 faster?
+                if res1.time < res2.time
+                    comment = @sprintf("Both succeeded, S1 faster by %.2fs", res2.time - res1.time)
+                    is_candidate = true
+                else
+                    comment = "Both succeeded, S2 faster or equal"
+                end
+            elseif !res1.success
+                comment = "S1 failed to evade"
+            else
+                comment = "S1 evaded but missed goal"
+            end
+            
+            # Check if this is the best candidate so far
+            if is_candidate
+                perf_margin = res2.success ? (res2.time - res1.time) : Inf
+                if perf_margin > best_perf_margin
+                    best_perf_margin = perf_margin
+                    best_params = (K1=K1, K2=K2)
+                end
+            end
+
+            res1_str = @sprintf("Success: %-5s, Time: %4.1fs", string(res1.success), res1.time)
+            res2_str = @sprintf("Success: %-5s, Time: %4.1fs", string(res2.success), res2.time)
+            @printf "%-10.1f %-10.1f | %-25s | %-25s | %s\n" K1 K2 res1_str res2_str comment
+        end
+    end
+
+    println("-"^90)
+    if isnothing(best_params)
+        println("\n🔴 No parameters found where Strategy 1 was demonstrably better.")
+    else
+        println("\n🏆 Best Parameters Found for Strategy 1 (Evader-QP):")
+        println("   K1 = $(best_params.K1)")
+        println("   K2 = $(best_params.K2)")
+        println("   With these parameters, Strategy 1 provides the best advantage over Strategy 2.")
+    end
+end
+
+# --- Run the entire analysis ---
+find_best_parameters()
+
+println("\nScript finished. Press Enter to exit...")
+readline()

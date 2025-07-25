@@ -1,3 +1,8 @@
+
+#This script is for PE with interception logic with slow evader and faster pursuer
+#Also has CBF for front, left, right evasion maneuvers.
+
+
 using OSQP
 using Plots
 using LinearAlgebra
@@ -32,9 +37,10 @@ const K1 = 3.0
 const K2 = 2.0
 
 # Control limits
-const V_MAX_1 = 2.0 
-const V_MAX_2 = 3.0
-const A_MIN, A_MAX = -1.0, 1.0
+const V_MAX_1 = 4.75 
+const V_MAX_2 = 2.75
+const A_MIN, A_MAX = -2.0, 2.0
+const N_MAX = 15.0
 const W_MIN, W_MAX = -pi, pi
 
 function calc_intercept_pt(state1, state2)
@@ -79,17 +85,47 @@ function calc_intercept_pt(state1, state2)
 end
     
 
+function check_interception(hist_state1, hist_state2, R_AGENT, DT)
+    println("\n--- Interception Check ---")
+    min_dist = Inf
+    time_of_min_dist = 0.0
+    collision_dist = 2 * R_AGENT
+    
+    # Iterate through the entire history
+    for i in 1:length(hist_state1)
+        p1 = hist_state1[i][1:2]
+        p2 = hist_state2[i][1:2]
+        dist = norm(p1 - p2)
+        
+        if dist < min_dist
+            min_dist = dist
+            time_of_min_dist = (i - 1) * DT
+        end
+    end
+    
+    println("Minimum distance between vehicles: ", round(min_dist, digits=3), " m")
+    println("This occurred at time: ", round(time_of_min_dist, digits=2), " s")
+    println("Collision distance (sum of radii): ", collision_dist, " m")
+    
+    if min_dist <= collision_dist
+        println("🔴 RESULT: Interception occurred!")
+    else
+        println("✅ RESULT: No interception occurred. The CBF successfully maintained separation.")
+    end
+end
+
+
 function run_simulation()
     interceptionHist = []
 
     # Vehicle 1 (Evader): Starts on the left, goal is on the right
-    state1 = [-10.0, 1.0, 0.0, 0.0]
+    state1 = [-10.0, 1.0, 0.0, V_MAX_1]
     goal1 = [10.0, 1.0]
     hist_state1 = [state1]
     hist_control1 = [[0.0, 0.0]]
 
     # Vehicle 2 (Pursuer): Starts on the right, goal is point of interception
-    state2 = [5.0, -1.0, pi, V_MAX_2]
+    state2 = [7.0, -1.0, pi, V_MAX_2]
     hist_state2 = [state2]
     hist_control2 = [[0.0, 0.0]]
 
@@ -113,11 +149,9 @@ function run_simulation()
         angle_to_goal1 = atan(error1[2], error1[1])
         psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
 
-        # Implementing 2 different types of speed bases 
         # Speed is determined by turning. Sharper turn = slower speed, and vice versa
         v_turn_based = V_MAX_1 * (1.0 - 0.5 * abs(psi_error1) / pi)
- 
-        
+         
         v_desired = min(v_turn_based)
         a_n1 = 0.5 * (v_desired - state1[4])
         
@@ -169,16 +203,22 @@ function run_simulation()
 
         H = diagm([20.0, 0.1])
         P = sparse(H * 2.0)
-        q = -2.0 * H * u_n1
         A = sparse([A_cbf; I(2)])
-        l = [b_cbf_lower; A_MIN; W_MIN]
-        u = [Inf; Inf; Inf; A_MAX; W_MAX]
+        l = [b_cbf_lower; A_MIN; -N_MAX/state1[4]] - (A*u_n1)
+        u = [Inf; Inf; Inf; A_MAX; N_MAX/state1[4]] - (A*u_n1)
 
         model = OSQP.Model()
-        OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
+        OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
 
-        u1_safe = results.info.status == :Solved ? results.x : u_n1
+        if results.info.status == :Solved
+            u1_safe = results.x
+        else
+            println("Warning: QP not solved at step $i. Evader using nominal control.")
+        end
+        
+
+        u1_safe = results.info.status == :Solved ? results.x + u_n1 : u_n1
         u2_safe = u_n2 
 
         state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
@@ -248,26 +288,28 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2
     savefig(static_plot, plot_path)
     println("Analysis plots saved to $plot_path")
 
-    anim = @animate for i in 1:lastindex(interceptionHist)
-        p_anim = plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
-             xlims=(-12, 12), ylims=(-6, 6),
-             xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion with CBF (Frame $i)")
-        plot!(p_anim, x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
-        plot!(p_anim, x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1", color=:blue)
-        plot!(p_anim, x2_hist[i] .+ R_AGENT .* cos.(theta), y2_hist[i] .+ R_AGENT .* sin.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 2", color=:orange)
-        intercept_pt = interceptionHist[i]
-        scatter!(p_anim, [intercept_pt[1]], [intercept_pt[2]], label="Intercept Pt.", marker=:star5, markersize=6, color=:red)
-        scatter!(p_anim, [goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
-    end
+    # anim = @animate for i in 1:lastindex(interceptionHist)
+    #     p_anim = plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
+    #          xlims=(-12, 12), ylims=(-6, 6),
+    #          xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion with CBF (Frame $i)")
+    #     plot!(p_anim, x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
+    #     plot!(p_anim, x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1", color=:blue)
+    #     plot!(p_anim, x2_hist[i] .+ R_AGENT .* cos.(theta), y2_hist[i] .+ R_AGENT .* sin.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 2", color=:orange)
+    #     intercept_pt = interceptionHist[i]
+    #     #scatter!(p_anim, [intercept_pt[1]], [intercept_pt[2]], label="Intercept Pt.", marker=:star5, markersize=6, color=:red)
+    #     scatter!(p_anim, [goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
+    # end
 
-    gif_path = "cbf_simulation_pursuit2.gif"
-    gif(anim, gif_path, fps = 15)
-    println("Animation saved to $gif_path")
+    # gif_path = "cbf_simulation_pursuit2.gif"
+    # gif(anim, gif_path, fps = 15)
+    # println("Animation saved to $gif_path")
 end
 
 # Run Simulation and Generate GIF
 hist_state1, hist_state2, hist_control1, hist_control2, hist_h, hist_h_dot, interceptionHist = run_simulation()
 plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2, hist_h, hist_h_dot, interceptionHist)
+
+check_interception(hist_state1, hist_state2, R_AGENT, DT)
 
 println("Script finished. Press Enter to exit...")
 readline()
@@ -283,10 +325,24 @@ readline()
 # Pursuer evader for proof of concept
 # Multivehicular pe for reality proof
 
-# Two go to the right
-# Three going to the left 
+
+# Talk about why we use left straight right rather than any given number within the range
+
+# TO-DO: 
+
+# Play around with K values to understand what it does 
+# Continue writing project formulation
+# Find parameters that make cbf fail going straight only 
+# And then find parameters using right left straight that show comparison 
 
 
+# General Problem Outline
+
+# Constant Speed CBF
+# Variable Speed CBF
+# Variable Speed with Left Straight right
+# Korean Paper
 
 
-# Get rid of pursuer evasion -- not necessary for this one 
+# Add evader collision avoidance
+# Write 1-2 conclusion/problem for references 

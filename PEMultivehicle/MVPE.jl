@@ -244,7 +244,7 @@ function plot_and_animate(hist_states, hist_controls, interceptionHist)
     goal2_pos = [10.0, -2.0]
     theta = 0:0.1:(2*pi+0.1)
     
-    colors = [:blue, :cyan, :red, :orange, :purple]
+    colors = [:blue, :cyan, :red,  :orange, :purple]
     labels = ["E1", "E2", "P1", "P2", "P3"]
 
     anim = @animate for i in 1:lastindex(interceptionHist[1])

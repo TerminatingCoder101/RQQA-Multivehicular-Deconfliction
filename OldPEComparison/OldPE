@@ -1,0 +1,281 @@
+using OSQP
+using Plots
+using LinearAlgebra
+using SparseArrays
+using Printf
+
+# ==============================================================================
+# SECTION 1: SETUP
+# ==============================================================================
+
+# -- Vehicle Dynamics Model --
+# state = [x, y, psi, v] (position, heading, and forward speed)
+# control = [a, w] (forward acceleration and angular velocity)
+function vehicle_dynamics(state, control)
+    x, y, psi, v = state
+    a, w = control
+
+    x_dot = v * cos(psi)
+    y_dot = v * sin(psi)
+    psi_dot = w
+    v_dot = a
+
+    return [x_dot, y_dot, psi_dot, v_dot]
+end
+
+# -- Simulation Parameters --
+const DT = 0.1        # Time step [s]
+const T_MAX = 30.0
+const N_STEPS = Int(T_MAX / DT)
+
+# -- Agent & Safety Parameters --
+const R_AGENT = 0.5
+const COLLISION_DISTANCE = R_AGENT
+const D_MIN_TOTAL = 1.5 * R_AGENT + 1.0 # Min safe distance for CBF
+
+# -- Second-order CBF parameters (h_ddot + K1*h_dot + K2*h >= 0) --
+const K1 = 3.0
+const K2 = 2.0
+
+# -- Control Limits --
+const V_MAX_1 = 2.0   # Evader is faster
+const V_MAX_2 = 2.75  # Pursuer is slower
+const A_MIN, A_MAX = -2.0, 2.0
+const N_MAX = 15.0
+const W_MIN, W_MAX = -pi, pi
+
+
+# ==============================================================================
+# SECTION 2: SIMULATION
+# ==============================================================================
+
+function run_simulation()
+    # -- Initial Conditions --
+    # Vehicle 1 (Evader): Starts on the left, goal is on the right
+    state1 = [-10.0, 1.0, 0.0, 0.0] # Start from rest
+    goal1 = [10.0, 1.0]
+    hist_state1 = [state1]
+    hist_control1 = [[0.0, 0.0]]
+
+    # Vehicle 2 (Pursuer): Starts on the right, goal is Vehicle 1
+    state2 = [5.0, -1.0, pi, V_MAX_2] # Start at max speed
+    hist_state2 = [state2]
+    hist_control2 = [[0.0, 0.0]]
+
+    println("Starting simulation...")
+
+    # -- Simulation Loop --
+    for i in 1:N_STEPS
+        # Check if the evader has reached its goal
+        if norm(state1[1:2] - goal1) < 0.3
+            println("Evader reached goal at step $i. Stopping simulation.")
+            break
+        end
+
+        p1 = hist_state1[i][1:2]
+        p2 = hist_state2[i][1:2]
+        dist = norm(p1 - p2)
+        
+        if dist < COLLISION_DISTANCE || dist == COLLISION_DISTANCE
+            println("Evader was caught \n")
+            break
+        end
+
+        # -- Step 1: Calculate Nominal Controllers for Both Agents --
+
+        # Nominal Controller for Vehicle 1 (Evader) - seeks its goal
+        error1 = goal1 - state1[1:2]
+        angle_to_goal1 = atan(error1[2], error1[1])
+        psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
+        a_n1 = 0.5 * (V_MAX_1 - state1[4]) # Accelerate to max speed
+        w_n1 = 2.0 * psi_error1
+        u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
+
+        # Nominal Controller for Vehicle 2 (Pursuer) - aggressively tracks evader
+        goal2 = state1[1:2] # Pursuer's goal is always the evader's current position
+        error2 = goal2 - state2[1:2]
+        angle_to_goal2 = atan(error2[2], error2[1])
+        psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
+        a_n2 = 0.5 * (V_MAX_2 - state2[4])
+        w_n2 = 2.0 * psi_error2
+        u_n2 = clamp.([a_n2, w_n2], [A_MIN, W_MIN], [A_MAX, W_MAX])
+        # u_n2 is the pursuer's final, unmodified control input for this step.
+
+        # -- Step 2: Formulate and Solve CBF-QP for the Evader ONLY --
+
+        p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
+        p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
+
+        delta_p = p1 - p2
+        v1_vec = v1 * [cos(psi1), sin(psi1)]
+        v2_vec = v2 * [cos(psi2), sin(psi2)]
+        delta_v = v1_vec - v2_vec
+
+        h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
+        h_dot = 2 * dot(delta_p, delta_v)
+
+        # The CBF constraint is: h_ddot + K1*h_dot + K2*h >= 0
+        # We need to express h_ddot in terms of control inputs u1=[a1, w1] and u2=[a2, w2]
+        # h_ddot = 2*||v1-v2||^2 + 2*delta_p'*(a1_vec - a2_vec)
+        # We rearrange to isolate the terms with the evader's control u1:
+        # L_g1*u1 >= -L_f^2*h - L_g2*u2 - K1*h_dot - K2*h
+        
+        # Lie derivatives w.r.t. evader's control [a1, w1]
+        g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
+        g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
+        
+        # Calculate the right-hand side of the inequality, which is now a constant
+        # as it depends on the state and the pursuer's fixed nominal control u_n2.
+        a2_vec = u_n2[1] * [cos(psi2), sin(psi2)] - v2 * u_n2[2] * [sin(psi2), -cos(psi2)]
+        
+        # The part of h_ddot that does not depend on u1
+        h_ddot_fixed_part = 2*dot(delta_v, delta_v) + 2*dot(delta_p, -a2_vec)
+        
+        b_cbf_lower = -(h_ddot_fixed_part + K1*h_dot + K2*h)
+
+        # QP formulation: min (u1-u_n1)'*H*(u1-u_n1)
+        # The decision variable is only u1 = [a1, w1]
+        H = diagm([20.0, 0.1]) # Costs for Evader's control (a, w)
+        P = sparse(H * 2.0)
+        q = -2.0 * H * u_n1
+        
+        # Define constraints for the QP
+        # A_cbf * u1 >= b_cbf_lower
+        A_cbf = [g_a1 g_w1] # This is a 1x2 matrix
+        
+        A = sparse([A_cbf; I(2)]) # Add control limits
+        l = [b_cbf_lower; A_MIN; -N_MAX/state1[4]]
+        u = [Inf; A_MAX; N_MAX/state1[4]]
+        
+        # Create and solve the OSQP problem
+        model = OSQP.Model()
+        OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
+        results = OSQP.solve!(model)
+        
+        # -- Step 3: Determine Final Control Inputs --
+        u1_safe = u_n1 # Default to nominal if solver fails
+        if results.info.status == :Solved
+            u1_safe = results.x
+        else
+            println("Warning: QP not solved at step $i. Evader using nominal control.")
+        end
+        
+        # Pursuer uses its unmodified, aggressive nominal control
+        u2_safe = u_n2
+
+        # -- Step 4: Update State and Store History --
+        state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
+        state1[4] = clamp(state1[4], 0.0, V_MAX_1)
+        
+        state2 = state2 + vehicle_dynamics(state2, u2_safe) * DT 
+        state2[4] = clamp(state2[4], 0.0, V_MAX_2)
+        
+        push!(hist_state1, state1)
+        push!(hist_state2, state2)
+        push!(hist_control1, u1_safe)
+        push!(hist_control2, u2_safe)
+    end
+
+    println("Simulation finished.")
+    return hist_state1, hist_state2, hist_control1, hist_control2
+end
+
+
+# ==============================================================================
+# SECTION 3: PLOTTING AND ANALYSIS
+# ==============================================================================
+
+function check_interception(hist_state1, hist_state2)
+    println("\n--- Interception Analysis ---")
+    min_dist = Inf
+    time_of_min_dist = 0.0
+    
+    for i in 1:length(hist_state1)
+        p1 = hist_state1[i][1:2]
+        p2 = hist_state2[i][1:2]
+        dist = norm(p1 - p2)
+        
+        if dist < min_dist
+            min_dist = dist
+            time_of_min_dist = (i - 1) * DT
+        end
+    end
+    
+    @printf("Minimum distance between vehicles: %.3f m\n", min_dist)
+    @printf("This occurred at time: %.2f s\n", time_of_min_dist)
+    @printf("Collision distance (sum of radii): %.2f m\n", COLLISION_DISTANCE)
+    
+    if min_dist <= COLLISION_DISTANCE
+        println("🔴 RESULT: Interception Occurred! The evader was caught.")
+    else
+        println("✅ RESULT: Evasion Successful! The CBF successfully maintained separation.")
+    end
+end
+
+function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2)
+    println("Generating plots and animation...")
+    
+    # Extract data for plots
+    num_steps_run = length(hist_state1) - 1
+    time_axis_states = 0:DT:(num_steps_run * DT)
+    time_axis_controls = 0:DT:((num_steps_run-1) * DT)
+
+    x1_hist = [s[1] for s in hist_state1]; y1_hist = [s[2] for s in hist_state1]
+    v1_hist = [s[4] for s in hist_state1]; w1_hist = [c[2] for c in hist_control1[2:end]]
+    
+    x2_hist = [s[1] for s in hist_state2]; y2_hist = [s[2] for s in hist_state2]
+    v2_hist = [s[4] for s in hist_state2]; w2_hist = [c[2] for c in hist_control2[2:end]]
+
+    goal1_pos = [10.0, 1.0]
+    theta = 0:0.1:(2*pi+0.1)
+
+    # -- Generate Static Plots for Analysis --
+    p_traj = plot(x1_hist, y1_hist, label="V1 Path (Evader)", lw=2, aspect_ratio=:equal,
+                  xlabel="x [m]", ylabel="y [m]", title="Vehicle Trajectories")
+    plot!(p_traj, x2_hist, y2_hist, label="V2 Path (Pursuer)", lw=2)
+    scatter!(p_traj, [goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
+
+    p_vel = plot(time_axis_states, v1_hist, label="V1 (Evader)", lw=2, title="Velocity Profiles")
+    plot!(p_vel, time_axis_states, v2_hist, label="V2 (Pursuer)", lw=2, xlabel="Time [s]", ylabel="Velocity [m/s]")
+    
+    p_rot = plot(time_axis_controls, w1_hist, label="V1 (Evader)", lw=2, title="Rotational Speeds")
+    plot!(p_rot, time_axis_controls, w2_hist, label="V2 (Pursuer)", lw=2, xlabel="Time [s]", ylabel="ω [rad/s]")
+
+    static_plot = plot(p_traj, p_vel, p_rot, layout=(1,3), size=(1800, 500), legend=:bottomleft)
+    
+    plot_path = "cbf_evader_only_analysis.png"
+    savefig(static_plot, plot_path)
+    println("Analysis plots saved to $plot_path")
+
+    # -- Generate Animation --
+    anim = @animate for i in 1:length(hist_state1)
+        plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
+             xlims=(-12, 12), ylims=(-6, 6),
+             xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion: Evader-Only CBF (Frame $i)")
+        plot!(x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
+
+        plot!(x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta),
+              seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1 (Evader)", color=:blue)
+        plot!(x2_hist[i] .+ R_AGENT .* cos.(theta), y2_hist[i] .+ R_AGENT .* sin.(theta),
+              seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 2 (Pursuer)", color=:orange)
+              
+        scatter!([goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
+    end
+
+    gif_path = "cbf_evader_only_simulation.gif"
+    gif(anim, gif_path, fps = 15)
+    println("Animation saved to $gif_path")
+end
+
+
+# ==============================================================================
+# SECTION 4: EXECUTION
+# ==============================================================================
+
+# -- Run Simulation and Generate Outputs --
+hist_state1, hist_state2, hist_control1, hist_control2 = run_simulation()
+plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2)
+check_interception(hist_state1, hist_state2)
+
+println("\nScript finished. Press Enter to exit...")
+readline()
