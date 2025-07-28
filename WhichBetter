@@ -74,16 +74,16 @@ end
 
 # --- STRATEGY 1: Evader-Centric QP (Predicts Pursuer Moves) ---
 function run_simulation_strategy1(K1, K2)
-    interceptionHist =[]
+    interceptionHist = []
 
-   # Vehicle 1 (Evader): Starts on the left, goal is on the right
+    # Vehicle 1 (Evader): Starts on the left, goal is on the right
     state1 = [-10.0, 1.0, 0.0, V_MAX_1]
     goal1 = [10.0, 1.0]
     hist_state1 = [state1]
     hist_control1 = [[0.0, 0.0]]
 
     # Vehicle 2 (Pursuer): Starts on the right, goal is point of interception
-    state2 = [10.0, -1.0, pi, V_MAX_2]
+    state2 = [7.0, -1.0, pi, V_MAX_2]
     hist_state2 = [state2]
     hist_control2 = [[0.0, 0.0]]
 
@@ -117,9 +117,9 @@ function run_simulation_strategy1(K1, K2)
         u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
 
         # --- Nominal Controller for Vehicle 2 (Pursuer) ---
-
         interceptionPt = calc_intercept_pt(state1, state2)
         push!(interceptionHist, interceptionPt) # Store the calculated point
+        
         goal2 = interceptionPt
         error2 = goal2 - state2[1:2]
         angle_to_goal2 = atan(error2[2], error2[1])
@@ -140,6 +140,7 @@ function run_simulation_strategy1(K1, K2)
         
         h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
         h_dot = 2 * dot(delta_p, delta_v)
+
         push!(hist_h, h)
         push!(hist_h_dot, h_dot)
 
@@ -162,13 +163,12 @@ function run_simulation_strategy1(K1, K2)
 
         H = diagm([20.0, 0.1])
         P = sparse(H * 2.0)
-        q = -2.0 * H * u_n1
         A = sparse([A_cbf; I(2)])
-        l = [b_cbf_lower; A_MIN; -N_MAX/state1[4]]
-        u = [Inf; Inf; Inf; A_MAX; N_MAX/state1[4]]
+        l = [b_cbf_lower; A_MIN; -N_MAX/state1[4]] - (A*u_n1)
+        u = [Inf; Inf; Inf; A_MAX; N_MAX/state1[4]] - (A*u_n1)
 
         model = OSQP.Model()
-        OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
+        OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
 
         if results.info.status == :Solved
@@ -178,7 +178,7 @@ function run_simulation_strategy1(K1, K2)
         end
         
 
-        u1_safe = results.info.status == :Solved ? results.x : u_n1
+        u1_safe = results.info.status == :Solved ? results.x + u_n1 : u_n1
         u2_safe = u_n2 
 
         state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
@@ -193,18 +193,21 @@ end
 
 # --- STRATEGY 2: Shared Responsibility QP ---
 function run_simulation_strategy2(K1, K2)
-   
     # -- Initial Conditions --
     # Vehicle 1 (Evader): Starts on the left, goal is on the right
-    state1 = [-10.0, 1.0, 0.0, V_MAX_1] # Start from rest
+    state1 = [-10.0, 1.0, 0.0, V_MAX_1]
     goal1 = [10.0, 1.0]
     hist_state1 = [state1]
     hist_control1 = [[0.0, 0.0]]
 
-    # Vehicle 2 (Pursuer): Starts on the right, goal is Vehicle 1
-    state2 = [10.0, -1.0, pi, V_MAX_2] # Start at max speed
+    state2 = [7.0, -1.0, pi, V_MAX_2] # Start at max speed
     hist_state2 = [state2]
     hist_control2 = [[0.0, 0.0]]
+
+    hist_h = Float64[]
+    hist_h_dot = Float64[]
+
+    println("Starting simulation...")
 
     # -- Simulation Loop --
     for i in 1:N_STEPS
@@ -214,23 +217,35 @@ function run_simulation_strategy2(K1, K2)
             break
         end
 
-        # Nominal Controller for Vehicle 1 (Evader) - seeks its goal
+        p1 = hist_state1[i][1:2]
+        p2 = hist_state2[i][1:2]
+        dist = norm(p1 - p2)
+        
+        if dist < COLLISION_DISTANCE || dist == COLLISION_DISTANCE
+            println("Evader was caught \n")
+            break
+        end
+
+        # Nominal Controller for Vehicle 1
         error1 = goal1 - state1[1:2]
         angle_to_goal1 = atan(error1[2], error1[1])
         psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
-        a_n1 = 0.5 * (V_MAX_1 - state1[4]) # Accelerate to max speed
+        v_turn_based = V_MAX_1 * (1.0 - 0.5 * abs(psi_error1) / pi)
+        v_desired = min(v_turn_based)
+        a_n1 = 0.5 * (v_desired - state1[4])
         w_n1 = 2.0 * psi_error1
         u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
 
-        # Nominal Controller for Vehicle 2 (Pursuer) - aggressively tracks evader
+        # Nominal Controller for Vehicle 2
         goal2 = state1[1:2] # Pursuer's goal is always the evader's current position
         error2 = goal2 - state2[1:2]
         angle_to_goal2 = atan(error2[2], error2[1])
         psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
-        a_n2 = 0.5 * (V_MAX_2 - state2[4])
+        
+        v_desired_2 = V_MAX_2 * (1.0 - 0.7 * abs(psi_error2) / pi)
+        a_n2 = 0.5 * (v_desired_2 - state2[4])
         w_n2 = 2.0 * psi_error2
         u_n2 = clamp.([a_n2, w_n2], [A_MIN, W_MIN], [A_MAX, W_MAX])
-
 
         p1 = state1[1:2]; psi1 = state1[3]; v1 = state1[4]
         p2 = state2[1:2]; psi2 = state2[3]; v2 = state2[4]
@@ -242,43 +257,42 @@ function run_simulation_strategy2(K1, K2)
 
         h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
         h_dot = 2 * dot(delta_p, delta_v)
+
+        push!(hist_h, h)
+        push!(hist_h_dot, h_dot)
         
         g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
         g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
         
         a2_vec = u_n2[1] * [cos(psi2), sin(psi2)] - v2 * u_n2[2] * [sin(psi2), -cos(psi2)]
         
-        h_ddot_fixed_part = 2*dot(delta_v, delta_v) + 2*dot(delta_p, -a2_vec)
+        Lfh = 2*dot(delta_v, delta_v) + 2*dot(delta_p, -a2_vec) + K1*h_dot + K2*h
         
-        b_cbf_lower = -(h_ddot_fixed_part + K1*h_dot + K2*h)
-
+        b_cbf_lower = -Lfh
+        
         H = diagm([20.0, 0.1])
         P = sparse(H * 2.0)
-
-        
-        # Define constraints for the QP
-        # A_cbf * u1 >= b_cbf_lower
-        A_cbf = [g_a1 g_w1]
+        A_cbf = [g_a1 g_w1] 
         
         A = sparse([A_cbf; I(2)])
-        l = [b_cbf_lower; A_MIN; W_MIN]
-        u = [Inf; A_MAX; W_MAX]
-        
+        l = [b_cbf_lower; A_MIN; -N_MAX/state1[4]] - (A*u_n1)
+        u = [Inf; A_MAX; N_MAX/state1[4]] - (A*u_n1)
+
         model = OSQP.Model()
         OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
         
-        # -- Step 3: Determine Final Control Inputs --
+
         u1_safe = u_n1 # Default to nominal if solver fails
         if results.info.status == :Solved
-            u1_safe = results.x
+            u1_safe = results.x + u_n1
         else
             println("Warning: QP not solved at step $i. Evader using nominal control.")
         end
         
+        # Pursuer uses its unmodified, aggressive nominal control
         u2_safe = u_n2
 
-        # -- Step 4: Update State and Store History --
         state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
         state1[4] = clamp(state1[4], 0.0, V_MAX_1)
         
@@ -319,7 +333,7 @@ function find_best_parameters()
     best_perf_margin = -Inf # Performance margin: Time_S2 - Time_S1
 
     println("--- Starting Parameter Sweep for K1 and K2 ---")
-    println("Goal: Find K values where Strategy 1 (Evader-QP) succeeds and is better than Strategy 2 (Shared-QP).\n")
+    println("Goal: Find K values where Strategy 1 (3D-QP) succeeds and is better than Strategy 2 (Reg-QP).\n")
     @printf "%-10s %-10s | %-25s | %-25s | %s\n" "K1" "K2" "Strategy 1 Result" "Strategy 2 Result" "Comment"
     println("-"^90)
 

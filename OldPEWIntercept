@@ -27,33 +27,15 @@ const R_AGENT = 0.5
 const COLLISION_DISTANCE = R_AGENT
 const D_MIN_TOTAL = 1.5 * R_AGENT + 1.0
 
-const K1 = 1.0
-const K2 = 0.5
+const K1 = 3.0
+const K2 = 2.0
 
 # Control Limits
-const V_MAX_1 = 3.75 
-const V_MAX_2 = 3.75
+const V_MAX_1 = 4.75 
+const V_MAX_2 = 2.75
 const A_MIN, A_MAX = -2.0, 2.0
 const N_MAX = 15.0
 const W_MIN, W_MAX = -pi, pi
-
-function calculate_safety_violation_area(hist_h, dt)
-    total_violation_area = 0.0
-    
-    for i in 1:(length(hist_h) - 1)
-        h1 = hist_h[i]
-        h2 = hist_h[i+1]
-        
-        h1_neg = min(0.0, h1)
-        h2_neg = min(0.0, h2)
-        
-        segment_area = (h1_neg + h2_neg) / 2.0 * dt
-        
-        total_violation_area += abs(segment_area)
-    end
-    
-    return total_violation_area # m^2 * s units 
-end
 
 function run_simulation()
     # -- Initial Conditions --
@@ -66,9 +48,6 @@ function run_simulation()
     state2 = [7.0, -1.0, pi, V_MAX_2] # Start at max speed
     hist_state2 = [state2]
     hist_control2 = [[0.0, 0.0]]
-
-    hist_h = Float64[]
-    hist_h_dot = Float64[]
 
     println("Starting simulation...")
 
@@ -89,24 +68,19 @@ function run_simulation()
             break
         end
 
-        # Nominal Controller for Vehicle 1
+        # Nominal Controller for Vehicle 1 (Evader) - seeks its goal
         error1 = goal1 - state1[1:2]
         angle_to_goal1 = atan(error1[2], error1[1])
         psi_error1 = atan(sin(angle_to_goal1 - state1[3]), cos(angle_to_goal1 - state1[3]))
-        v_turn_based = V_MAX_1 * (1.0 - 0.5 * abs(psi_error1) / pi)
-        v_desired = min(v_turn_based)
-        a_n1 = 0.5 * (v_desired - state1[4])
+        a_n1 = 0.5 * (V_MAX_1 - state1[4])
         w_n1 = 2.0 * psi_error1
         u_n1 = clamp.([a_n1, w_n1], [A_MIN, W_MIN], [A_MAX, W_MAX])
 
-        # Nominal Controller for Vehicle 2
         goal2 = state1[1:2] # Pursuer's goal is always the evader's current position
         error2 = goal2 - state2[1:2]
         angle_to_goal2 = atan(error2[2], error2[1])
         psi_error2 = atan(sin(angle_to_goal2 - state2[3]), cos(angle_to_goal2 - state2[3]))
-        
-        v_desired_2 = V_MAX_2 * (1.0 - 0.7 * abs(psi_error2) / pi)
-        a_n2 = 0.5 * (v_desired_2 - state2[4])
+        a_n2 = 0.5 * (V_MAX_2 - state2[4])
         w_n2 = 2.0 * psi_error2
         u_n2 = clamp.([a_n2, w_n2], [A_MIN, W_MIN], [A_MAX, W_MAX])
 
@@ -121,8 +95,6 @@ function run_simulation()
         h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
         h_dot = 2 * dot(delta_p, delta_v)
 
-        push!(hist_h, h)
-        push!(hist_h_dot, h_dot)
         
         g_a1 = 2 * dot(delta_p, [cos(psi1), sin(psi1)])
         g_w1 = 2 * v1 * dot(delta_p, [-sin(psi1), cos(psi1)])
@@ -145,10 +117,10 @@ function run_simulation()
         OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
         results = OSQP.solve!(model)
         
-
+        # -- Step 3: Determine Final Control Inputs --
         u1_safe = u_n1 # Default to nominal if solver fails
         if results.info.status == :Solved
-            u1_safe = results.x + u_n1
+            u1_safe = results.x
         else
             println("Warning: QP not solved at step $i. Evader using nominal control.")
         end
@@ -156,6 +128,7 @@ function run_simulation()
         # Pursuer uses its unmodified, aggressive nominal control
         u2_safe = u_n2
 
+        # -- Step 4: Update State and Store History --
         state1 = state1 + vehicle_dynamics(state1, u1_safe) * DT
         state1[4] = clamp(state1[4], 0.0, V_MAX_1)
         
@@ -169,7 +142,7 @@ function run_simulation()
     end
 
     println("Simulation finished.")
-    return hist_state1, hist_state2, hist_control1, hist_control2, hist_h, hist_h_dot
+    return hist_state1, hist_state2, hist_control1, hist_control2
 end
 
 function check_interception(hist_state1, hist_state2)
@@ -199,7 +172,7 @@ function check_interception(hist_state1, hist_state2)
     end
 end
 
-function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2, hist_h, hist_h_dot)
+function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2)
     println("Generating plots and animation...")
     
     # Extract data for plots
@@ -209,78 +182,55 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2
 
     x1_hist = [s[1] for s in hist_state1]; y1_hist = [s[2] for s in hist_state1]
     v1_hist = [s[4] for s in hist_state1]; w1_hist = [c[2] for c in hist_control1[2:end]]
-    a1_hist = [c[1] for c in hist_control1[1:end]]
-
+    
     x2_hist = [s[1] for s in hist_state2]; y2_hist = [s[2] for s in hist_state2]
     v2_hist = [s[4] for s in hist_state2]; w2_hist = [c[2] for c in hist_control2[2:end]]
-    a2_hist = [c[1] for c in hist_control2[1:end]]
 
     goal1_pos = [10.0, 1.0]
     theta = 0:0.1:(2*pi+0.1)
 
     # -- Generate Static Plots for Analysis --
-      # 1. Trajectory Plot
     p_traj = plot(x1_hist, y1_hist, label="V1 Path (Evader)", lw=2, aspect_ratio=:equal,
                   xlabel="x [m]", ylabel="y [m]", title="Vehicle Trajectories")
     plot!(p_traj, x2_hist, y2_hist, label="V2 Path (Pursuer)", lw=2)
     scatter!(p_traj, [goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
 
-    # 2. Velocity Plot
     p_vel = plot(time_axis_states, v1_hist, label="V1 (Evader)", lw=2, title="Velocity Profiles")
     plot!(p_vel, time_axis_states, v2_hist, label="V2 (Pursuer)", lw=2, xlabel="Time [s]", ylabel="Velocity [m/s]")
-    hline!(p_vel, [V_MAX_1, V_MAX_2], linestyle=:dash, color=:red, label="Vel. Bounds")
-
-    # 3. Acceleration Plot
-    p_accel = plot(time_axis_states, a1_hist, label="A1 (Evader)", lw=2, title="Control Acceleration")
-    plot!(p_accel, time_axis_states, a2_hist, label="A2 (Pursuer)", lw=2, xlabel="Time [s]", ylabel="Acceleration [m/s^2]")
-    hline!(p_accel, [A_MAX, A_MIN], linestyle=:dash, color=:red, label="Bounds")
-
-    # 4. Rotational Speed Plot
+    
     p_rot = plot(time_axis_controls, w1_hist, label="V1 (Evader)", lw=2, title="Rotational Speeds")
     plot!(p_rot, time_axis_controls, w2_hist, label="V2 (Pursuer)", lw=2, xlabel="Time [s]", ylabel="ω [rad/s]")
-    hline!(p_rot, [W_MAX, W_MIN], linestyle=:dash, color=:blue, label="Angular Velocity Bounds")
 
-    # 5. H Values Plot
-    p_h = plot(time_axis_controls, hist_h, label="h(x)", lw=2, title="CBF Value (Safety Metric)", xlabel="Time [s]", ylabel="h(x) [DU^2]")
-    hline!(p_h, [0], linestyle=:dash, color=:red, label="Boundary (h=0)")
-
-    # 6. H_dot Values Plot
-    p_h_dot = plot(time_axis_controls, hist_h_dot, label="h_dot(x)", lw=2, title="CBF Derivative (Closure Rate)", xlabel="Time [s]", ylabel="h_dot(x) [DU^2/s]")
-
-    static_plot = plot(p_traj, p_vel, p_accel, p_rot, p_h, p_h_dot, layout=(2,3), size=(1800, 1500))
+    static_plot = plot(p_traj, p_vel, p_rot, layout=(1,3), size=(1800, 500), legend=:bottomleft)
     
     plot_path = "cbf_evader_only_analysis.png"
     savefig(static_plot, plot_path)
     println("Analysis plots saved to $plot_path")
 
-    # # -- Generate Animation --
-    # anim = @animate for i in 1:length(hist_state1)
-    #     plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
-    #          xlims=(-12, 12), ylims=(-6, 6),
-    #          xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion: Evader-Only CBF (Frame $i)")
-    #     plot!(x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
+    # -- Generate Animation --
+    anim = @animate for i in 1:length(hist_state1)
+        plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
+             xlims=(-12, 12), ylims=(-6, 6),
+             xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion: Evader-Only CBF (Frame $i)")
+        plot!(x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
 
-    #     plot!(x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta),
-    #           seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1 (Evader)", color=:blue)
-    #     plot!(x2_hist[i] .+ R_AGENT .* cos.(theta), y2_hist[i] .+ R_AGENT .* sin.(theta),
-    #           seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 2 (Pursuer)", color=:orange)
+        plot!(x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta),
+              seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1 (Evader)", color=:blue)
+        plot!(x2_hist[i] .+ R_AGENT .* cos.(theta), y2_hist[i] .+ R_AGENT .* sin.(theta),
+              seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 2 (Pursuer)", color=:orange)
               
-    #     scatter!([goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
-    # end
+        scatter!([goal1_pos[1]], [goal1_pos[2]], label="V1 Goal", marker=:xcross, markersize=8, color=:green)
+    end
 
-    # gif_path = "cbf_evader_only_simulation.gif"
-    # gif(anim, gif_path, fps = 15)
-    # println("Animation saved to $gif_path")
+    gif_path = "cbf_evader_only_simulation.gif"
+    gif(anim, gif_path, fps = 15)
+    println("Animation saved to $gif_path")
 end
 
 # -- Run Simulation and Generate Outputs --
-hist_state1, hist_state2, hist_control1, hist_control2, hist_h, hist_h_dot = run_simulation()
-plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2,hist_h, hist_h_dot)
+hist_state1, hist_state2, hist_control1, hist_control2 = run_simulation()
+plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2)
 check_interception(hist_state1, hist_state2)
-
-violation_area = calculate_safety_violation_area(hist_h, DT)
-println("\n--- CBF Violation Analysis ---")
-println("Total integrated safety violation (m^2*s): \n", violation_area)
 
 println("\nScript finished. Press Enter to exit...")
 readline()

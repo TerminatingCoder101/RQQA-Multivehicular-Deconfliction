@@ -33,15 +33,34 @@ const D_MIN_TOTAL = 1.5 * R_AGENT + 1
 const D_THREAT = 3.0
 
 # Second-order CBF parameters (h_ddot + K1*h_dot + K2*h >= 0)
-const K1 = 3.0
-const K2 = 2.0
+const K1 = 1.0
+const K2 = 0.5
 
 # Control limits
-const V_MAX_1 = 4.75 
-const V_MAX_2 = 2.75
+const V_MAX_1 = 3.75 
+const V_MAX_2 = 3.75
 const A_MIN, A_MAX = -2.0, 2.0
 const N_MAX = 15.0
 const W_MIN, W_MAX = -pi, pi
+
+function calculate_safety_violation_area(hist_h, dt)
+    total_violation_area = 0.0
+    
+    for i in 1:(length(hist_h) - 1)
+        h1 = hist_h[i]
+        h2 = hist_h[i+1]
+        
+        h1_neg = min(0.0, h1)
+        h2_neg = min(0.0, h2)
+        
+        # Area of the trapezoid for this segment
+        segment_area = (h1_neg + h2_neg) / 2.0 * dt
+        
+        total_violation_area += abs(segment_area)
+    end
+    
+    return total_violation_area # m^2 * s units 
+end
 
 function calc_intercept_pt(state1, state2)
     p1 = state1[1:2]
@@ -161,6 +180,7 @@ function run_simulation()
         # --- Nominal Controller for Vehicle 2 (Pursuer) ---
         interceptionPt = calc_intercept_pt(state1, state2)
         push!(interceptionHist, interceptionPt) # Store the calculated point
+
         goal2 = interceptionPt
         error2 = goal2 - state2[1:2]
         angle_to_goal2 = atan(error2[2], error2[1])
@@ -181,6 +201,7 @@ function run_simulation()
         
         h = dot(delta_p, delta_p) - D_MIN_TOTAL^2
         h_dot = 2 * dot(delta_p, delta_v)
+
         push!(hist_h, h)
         push!(hist_h_dot, h_dot)
 
@@ -290,7 +311,7 @@ function plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2
 
     # anim = @animate for i in 1:lastindex(interceptionHist)
     #     p_anim = plot(x1_hist[1:i], y1_hist[1:i], label="V1 Path", lw=2, aspect_ratio=:equal,
-    #          xlims=(-12, 12), ylims=(-6, 6),
+    #          xlims=(-15, 15), ylims=(-30, 20),
     #          xlabel="x [m]", ylabel="y [m]", title="Pursuit-Evasion with CBF (Frame $i)")
     #     plot!(p_anim, x2_hist[1:i], y2_hist[1:i], label="V2 Path", lw=2)
     #     plot!(p_anim, x1_hist[i] .+ R_AGENT .* cos.(theta), y1_hist[i] .+ R_AGENT .* sin.(theta), seriestype=:shape, fillalpha=0.3, lw=0, label="Vehicle 1", color=:blue)
@@ -311,12 +332,16 @@ plot_and_animate(hist_state1, hist_state2, hist_control1, hist_control2, hist_h,
 
 check_interception(hist_state1, hist_state2, R_AGENT, DT)
 
+violation_area = calculate_safety_violation_area(hist_h, DT)
+println("\n--- CBF Violation Analysis ---")
+println("Total integrated safety violation (m^2*s): \n", violation_area)
+
 println("Script finished. Press Enter to exit...")
 readline()
 
 
 
-
+#6.12937
 
 # Dubins vs dynamic speed -- stationary obstacle
 # Vehicles exchanging places
