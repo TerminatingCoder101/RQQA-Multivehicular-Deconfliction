@@ -127,9 +127,9 @@ function check_interception(hist_state1, hist_state2, R_AGENT, DT)
     println("Collision distance (sum of radii): ", collision_dist, " m")
     
     if min_dist <= collision_dist
-        println("🔴 RESULT: Interception occurred!")
+        println("RESULT: Interception occurred!")
     else
-        println("✅ RESULT: No interception occurred. The CBF successfully maintained separation.")
+        println("RESULT: No interception occurred. The CBF successfully maintained separation.")
     end
 end
 
@@ -340,8 +340,6 @@ println("Script finished. Press Enter to exit...")
 readline()
 
 
-
-#6.12937
 
 # Dubins vs dynamic speed -- stationary obstacle
 # Vehicles exchanging places

@@ -25,18 +25,19 @@ const N_STEPS = Int(T_MAX / DT)
 
 # Agent Properties
 const R_AGENT = 0.5
-const D_MIN_TOTAL = 3 * R_AGENT + 1 
+const D_MIN_TOTAL = 4 * R_AGENT + 1 
 const D_THREAT = 5.0
 
 # Second-order CBF parameters (h_ddot + K1*h_dot + K2*h >= 0)
-const K1 = 3.0
-const K2 = 2.0
+const K1 = 4.0
+const K2 = 3.0
 
 # Control limits
-const V_MAX_E = 2.0
-const V_MAX_P = 3.0
-const A_MIN, A_MAX = -1.0, 1.0
+const V_MAX_E = 3.0
+const V_MAX_P = 2.0
+const A_MIN, A_MAX = -5.0, 5.0
 const W_MIN, W_MAX = -pi, pi
+const N_MAX = 15.0
 
 function calc_intercept_pt(state_evader, state_pursuer, v_pursuer_max)
     p1 = state_evader[1:2]
@@ -75,11 +76,55 @@ function calc_intercept_pt(state_evader, state_pursuer, v_pursuer_max)
     return p1 + v1_vec * t
 end
     
+function check_all_interceptions(hist_states, R_AGENT, D_MIN_TOTAL, DT)
+    println("\n--- Interception Check ---")
+    
+    global_min_dist = Inf
+    time_of_min_dist = 0.0
+    closest_pair = (0, 0)
+    collision_dist = 2 * R_AGENT
+    num_agents = length(hist_states)
+    num_steps = length(hist_states[1])
+
+    # Iterate through all unique pairs of agents (e.g., 1-2, 1-3, ..., 4-5)
+    for i in 1:num_agents
+        for j in (i + 1):num_agents
+            # Find the minimum distance for this specific pair over time
+            for k in 1:num_steps
+                p_i = hist_states[i][k][1:2]
+                p_j = hist_states[j][k][1:2]
+                dist = norm(p_i - p_j)
+                
+                if dist < global_min_dist
+                    global_min_dist = dist
+                    time_of_min_dist = (k - 1) * DT
+                    closest_pair = (i,j)
+                end
+            end
+        end
+    end
+    
+    # --- Report Results ---
+    agent_labels = ["E1", "E2", "P1", "P2", "P3"]
+    println("Overall minimum distance achieved: ", round(global_min_dist, digits=3), " m")
+    println("This occurred between $(agent_labels[closest_pair[1]]) and $(agent_labels[closest_pair[2]]) at t = ", round(time_of_min_dist, digits=2), " s.")
+    println("\nRequired CBF separation (D_MIN_TOTAL): ", D_MIN_TOTAL, " m")
+    println("Physical collision distance (2 * R_AGENT): ", collision_dist, " m")
+    
+    if global_min_dist < collision_dist
+        println("RESULT: Physical collision occurred!")
+    elseif global_min_dist < D_MIN_TOTAL
+        println("RESULT: CBF constraint violated, but no physical collision.")
+    else
+        println("RESULT: No interception occurred. The CBF successfully maintained separation.")
+    end
+end
+
 
 function run_simulation()
     interceptionHist = [[], [], []]
-    state1 = [-10.0, 2.0, 0.0, 0.0]; goal1 = [10.0, 2.0]  # Evader 1
-    state2 = [-10.0, -2.0, 0.0, 0.0]; goal2 = [10.0, -2.0] # Evader 2
+    state1 = [-10.0, 2.0, 0.0, V_MAX_E]; goal1 = [10.0, 2.0]  # Evader 1
+    state2 = [-10.0, -2.0, 0.0, V_MAX_E]; goal2 = [10.0, -2.0] # Evader 2
     state3 = [10.0, 4.0, pi, V_MAX_P]   # Pursuer 1
     state4 = [10.0, 0.0, pi, V_MAX_P] # Pursuer 2
     state5 = [10.0, -4.0, pi, V_MAX_P] # Pursuer 3
@@ -92,8 +137,21 @@ function run_simulation()
 
     for i in 1:N_STEPS
         # Check for goal completion
-        if norm(states[1][1:2] - goal1) < 0.5 && norm(states[2][1:2] - goal2) < 0.5
-            println("Both evaders reached goal at step $i. Stopping simulation.")
+        if norm(states[1][1:2] - goal1) < 0.5
+            if states[1][4] != 0.0 # Only print once
+                println("Evader 1 reached goal at step $i. Stopping E1.")
+                states[1][4] = 0.0 # Stop evader 1
+            end
+        end
+        if norm(states[2][1:2] - goal2) < 0.5
+            if states[2][4] != 0.0 # Only print once
+                println("Evader 2 reached goal at step $i. Stopping E2.")
+                states[2][4] = 0.0 # Stop evader 2
+            end
+        end
+        # End simulation only if both have stopped
+        if states[1][4] == 0.0 && states[2][4] == 0.0
+            println("Both evaders reached goal. Ending simulation.")
             break
         end
 
@@ -203,18 +261,18 @@ function run_simulation()
                 b_cbf_lower = vcat(b_cbf_list...)
                 H = diagm([20.0, 0.1])
                 P = sparse(H * 2.0)
-                q = -2.0 * H * u_nominal[evader_idx]
                 A = sparse([A_cbf; I(2)])
-                l = [b_cbf_lower; A_MIN; W_MIN]
-                u = [fill(Inf, size(A_cbf, 1)); A_MAX; W_MAX]
+                l = [b_cbf_lower; A_MIN; -N_MAX/states[evader_idx][4]] - (A*u_nominal[evader_idx])
+                u = [fill(Inf, size(A_cbf, 1)); A_MAX; N_MAX/states[evader_idx][4]] - (A*u_nominal[evader_idx])
                 model = OSQP.Model()
-                OSQP.setup!(model; P=P, q=q, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
+                OSQP.setup!(model; P=P, A=A, l=l, u=u, verbose=false, eps_abs=1e-5, eps_rel=1e-5)
                 results = OSQP.solve!(model)
                 if results.info.status == :Solved
-                    u_safe[evader_idx] = results.x
+                    u_safe[evader_idx] = results.x + u_nominal[evader_idx]
+                else
+                    println("Warning: QP not solved at step $i. Evader using nominal control.")
+                    u_safe[evader_idx] = u_nominal[evader_idx]
                 end
-            else
-                println("List is empty")
             end
         end
 
@@ -235,36 +293,95 @@ end
 
 function plot_and_animate(hist_states, hist_controls, interceptionHist)
     println("Generating plots and animation...")
-    
-    # Extract histories
+
+    colors = [:blue, :cyan, :red, :orange, :purple]
+    labels = ["E1", "E2", "P1", "P2", "P3"]
+    goal1_pos = [10.0, 2.0]; 
+    goal2_pos = [10.0, -2.0]
+    R_AGENT = 0.5; DT = 0.1
+    A_MIN, A_MAX = -5.0, 5.0; W_MIN, W_MAX = -pi, pi
+    V_MAX_E = 4.0; V_MAX_P = 3.0
+
+    num_steps = length(hist_states[1])
+    time_axis_states = 0:DT:(num_steps-1)*DT
+    time_axis_controls = 0:DT:(length(hist_controls[1])-1)*DT
+
+
     x_hists = [[s[1] for s in hist] for hist in hist_states]
     y_hists = [[s[2] for s in hist] for hist in hist_states]
-    
-    goal1_pos = [10.0, 2.0]
-    goal2_pos = [10.0, -2.0]
-    theta = 0:0.1:(2*pi+0.1)
-    
-    colors = [:blue, :cyan, :red,  :orange, :purple]
-    labels = ["E1", "E2", "P1", "P2", "P3"]
+    v_hists = [[s[4] for s in hist] for hist in hist_states]
+    a_hists = [[c[1] for c in hist] for hist in hist_controls]
+    w_hists = [[c[2] for c in hist] for hist in hist_controls]
 
-    anim = @animate for i in 1:lastindex(interceptionHist[1])
+    # --- Create Static Analysis Plots ---
+
+    # 1. Trajectory Plot
+    p_traj = plot(aspect_ratio=:equal, xlabel="x [m]", ylabel="y [m]", title="Vehicle Trajectories")
+    for i in 1:5
+        plot!(p_traj, x_hists[i], y_hists[i], label=labels[i], lw=2, color=colors[i])
+    end
+    scatter!(p_traj, [goal1_pos[1]], [goal1_pos[2]], label="G1", marker=:xcross, markersize=8, color=colors[1])
+    scatter!(p_traj, [goal2_pos[1]], [goal2_pos[2]], label="G2", marker=:xcross, markersize=8, color=colors[2])
+
+    # 2. Velocity Plot
+    p_vel = plot(title="Velocity Profiles", xlabel="Time [s]", ylabel="Velocity [m/s]")
+    for i in 1:5
+        plot!(p_vel, time_axis_states, v_hists[i], label=labels[i], lw=2, color=colors[i])
+    end
+    hline!(p_vel, [V_MAX_E], linestyle=:dash, color=:gray, label="Evader V_max")
+    hline!(p_vel, [V_MAX_P], linestyle=:dash, color=:black, label="Pursuer V_max")
+
+    # 3. Acceleration Plot
+    p_accel = plot(title="Control Acceleration", xlabel="Time [s]", ylabel="Acceleration [m/s^2]")
+    for i in 1:5
+        plot!(p_accel, time_axis_controls, a_hists[i], label=labels[i], lw=2, color=colors[i])
+    end
+    hline!(p_accel, [A_MAX, A_MIN], linestyle=:dash, color=:red, label="Bounds")
+
+    # 4. Rotational Speed Plot
+    p_rot = plot(title="Rotational Speeds", xlabel="Time [s]", ylabel="ω [rad/s]")
+    for i in 1:5
+        plot!(p_rot, time_axis_controls, w_hists[i], label=labels[i], lw=2, color=colors[i])
+    end
+    hline!(p_rot, [W_MAX, W_MIN], linestyle=:dash, color=:red, label="Bounds")
+
+    # NOTE: CBF history (h, h_dot) is not saved during the simulation.
+    # To plot them, you would need to modify `run_simulation` to store these values.
+    # Therefore, the CBF plots have been removed from the combined static plot.
+    
+    # Combined Static Plot
+    static_plot = plot(p_traj, p_vel, p_accel, p_rot, layout=(2,2), size=(1600, 1200), legend=:outertopright)
+    
+    plot_path = "cbf_analysis_plots_2v3.png"
+    savefig(static_plot, plot_path)
+    println("Analysis plots saved to $plot_path")
+
+    # --- Create Animation ---
+    theta = 0:0.1:(2*pi+0.1)
+    # Determine the number of frames from the shortest history to be safe
+    num_frames = minimum(length(h) for h in x_hists)
+
+    anim = @animate for i in 1:num_frames
         p_anim = plot(aspect_ratio=:equal, xlims=(-12, 12), ylims=(-8, 8),
-             xlabel="x [m]", ylabel="y [m]", title="2v3 Pursuit-Evasion (Frame $i)")
+             xlabel="x [m]", ylabel="y [m]", title="2v3 Pursuit-Evasion (t=$(round(i*DT, digits=1))s)")
         
-        # Plot paths and current positions
+        # Plot paths and current agent positions
         for j in 1:5
             plot!(p_anim, x_hists[j][1:i], y_hists[j][1:i], label="", lw=2, c=colors[j])
             plot!(p_anim, x_hists[j][i].+R_AGENT.*cos.(theta), y_hists[j][i].+R_AGENT.*sin.(theta), 
                   seriestype=:shape, fillalpha=0.4, lw=0, label=labels[j], c=colors[j])
         end
         
-        # Plot goals and intercept points
-        scatter!(p_anim, [goal1_pos[1]], [goal1_pos[2]], label="G1", marker=:xcross, markersize=8, color=:blue)
-        scatter!(p_anim, [goal2_pos[1]], [goal2_pos[2]], label="G2", marker=:xcross, markersize=8, color=:cyan)
+        # Plot evader goals
+        scatter!(p_anim, [goal1_pos[1]], [goal1_pos[2]], label="G1", marker=:xcross, markersize=8, color=colors[1])
+        scatter!(p_anim, [goal2_pos[1]], [goal2_pos[2]], label="G2", marker=:xcross, markersize=8, color=colors[2])
         
+        # Plot pursuer intercept points if they exist for this frame
         for p_idx in 1:3
-             scatter!(p_anim, [interceptionHist[p_idx][i][1]], [interceptionHist[p_idx][i][2]], 
-                      label="IP$(p_idx)", marker=:star5, markersize=6, color=colors[p_idx+2])
+            if i <= length(interceptionHist[p_idx])
+                 scatter!(p_anim, [interceptionHist[p_idx][i][1]], [interceptionHist[p_idx][i][2]], 
+                          label="IP$(p_idx)", marker=:star5, markersize=6, color=colors[p_idx+2])
+            end
         end
     end
 
@@ -276,6 +393,8 @@ end
 # Run Simulation and Generate GIF
 hist_states, hist_controls, interceptionHist = run_simulation()
 plot_and_animate(hist_states, hist_controls, interceptionHist)
+
+check_all_interceptions(hist_states, R_AGENT, D_MIN_TOTAL, DT)
 
 println("Script finished. Press Enter to exit...")
 readline()

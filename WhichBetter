@@ -323,9 +323,8 @@ function analyze_run(hist_state1, hist_state2)
     return (min_dist=min_dist, success=evasion_successful, goal=goal_reached, time=time_to_goal)
 end
 
-# -- Main Execution and Parameter Sweep --
 function find_best_parameters()
-    # Define the search space for K parameters
+    
     K1_range = 1.0:1.0:6.0
     K2_range = 1.0:1.0:6.0
     
@@ -350,7 +349,7 @@ function find_best_parameters()
             comment = ""
             is_candidate = false
             if res1.success && res1.goal && !res2.success
-                comment = "✅ S1 SUCCESS, S2 FAILED"
+                comment = "S1 SUCCESS, S2 FAILED"
                 is_candidate = true
             elseif res1.success && res1.goal && res2.success && res2.goal
                 # If both succeed, is S1 faster?
@@ -383,7 +382,7 @@ function find_best_parameters()
 
     println("-"^90)
     if isnothing(best_params)
-        println("\n🔴 No parameters found where Strategy 1 was demonstrably better.")
+        println("\n No parameters found where Strategy 1 was demonstrably better.")
     else
         println("\n🏆 Best Parameters Found for Strategy 1 (Evader-QP):")
         println("   K1 = $(best_params.K1)")
